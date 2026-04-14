@@ -3,6 +3,9 @@ use crate::http::request::HttpRequest;
 use crate::http::response::HttpResponse;
 use crate::utils::logger::{log_info, log_warn, log_error};
 
+const CGI_TIMEOUT_ITERATIONS: i32 = 1000;
+const CGI_POLL_SLEEP_MS: u64 = 5;
+
 pub fn execute_cgi(
     req: &HttpRequest,
     script_path: &str,
@@ -117,8 +120,8 @@ pub fn execute_cgi(
             } else if n == 0 {
                 break;
             } else {
-                let err = *libc::__errno_location();
-                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAGAIN) || err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                     // Check if child is done
                     let mut status = 0i32;
                     let wpid = libc::waitpid(pid, &mut status, libc::WNOHANG);
@@ -134,14 +137,14 @@ pub fn execute_cgi(
                         break;
                     }
                     iterations += 1;
-                    if iterations > 1000 {
+                    if iterations > CGI_TIMEOUT_ITERATIONS {
                         log_warn("CGI timeout");
                         libc::kill(pid, libc::SIGTERM);
                         libc::waitpid(pid, &mut status, 0);
                         break;
                     }
                     // Small spin wait
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(std::time::Duration::from_millis(CGI_POLL_SLEEP_MS));
                 } else {
                     break;
                 }

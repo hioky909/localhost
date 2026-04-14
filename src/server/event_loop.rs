@@ -13,6 +13,7 @@ use std::path::Path;
 
 const MAX_EVENTS: usize = 64;
 const TIMEOUT_SECS: u64 = 60;
+const MAX_HEADER_SIZE: usize = 8192;
 
 pub struct EventLoop {
     pub epoll_fd: i32,
@@ -181,7 +182,7 @@ impl EventLoop {
             let max_size = self.server_config.first()
                 .map(|s| s.client_max_body_size)
                 .unwrap_or(10485760);
-            if conn.read_buf.len() > max_size + 8192 {
+            if conn.read_buf.len() > max_size + MAX_HEADER_SIZE {
                 let resp = HttpResponse::error(413, "Payload Too Large");
                 conn.write_buf = resp.to_bytes();
                 conn.state = ConnectionState::Writing;

@@ -68,10 +68,8 @@ pub fn handle_get(req: &HttpRequest, server: &ServerConfig, location: &LocationC
 
 pub fn handle_head(req: &HttpRequest, server: &ServerConfig, location: &LocationConfig, root: &str) -> HttpResponse {
     let mut resp = handle_get(req, server, location, root);
+    // Keep Content-Length as the actual body size (per RFC 7231), just clear the body
     resp.body = Vec::new();
-    if let Some(cl) = resp.headers.get_mut("Content-Length") {
-        *cl = "0".to_string();
-    }
     resp
 }
 
@@ -99,11 +97,18 @@ pub fn handle_post(req: &HttpRequest, _server: &ServerConfig, location: &Locatio
             })
             .unwrap_or_else(|| format!("upload_{}", timestamp_ms()));
 
-        // Sanitize filename
+        // Sanitize filename — reject dot-only names and names starting with a dot
         let safe_name: String = filename.chars()
             .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
             .collect();
-        let safe_name = if safe_name.is_empty() { format!("upload_{}", timestamp_ms()) } else { safe_name };
+        let safe_name = if safe_name.is_empty()
+            || safe_name.chars().all(|c| c == '.')
+            || safe_name.starts_with('.')
+        {
+            format!("upload_{}", timestamp_ms())
+        } else {
+            safe_name
+        };
 
         let target = dir.join(&safe_name);
         // Path traversal check

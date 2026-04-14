@@ -74,7 +74,10 @@ fn parse_server(tokens: &[String], mut pos: usize) -> Result<(ServerConfig, usiz
                 pos += 1;
                 if pos < tokens.len() {
                     let val = tokens[pos].trim_end_matches(';');
-                    config.client_max_body_size = val.parse().unwrap_or(1048576);
+                    config.client_max_body_size = val.parse().unwrap_or_else(|_| {
+                        eprintln!("[WARN] Invalid client_max_body_size '{}', using default 1048576", val);
+                        1048576
+                    });
                 }
                 pos += 1;
             }
