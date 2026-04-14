@@ -19,6 +19,8 @@ pub struct LocationConfig {
     pub upload_dir: Option<String>,
     pub root: Option<String>,
     pub cgi: HashMap<String, String>,
+    /// HTTP redirect: (status_code, target_url)
+    pub redirect: Option<(u16, String)>,
 }
 
 impl Default for LocationConfig {
@@ -30,6 +32,7 @@ impl Default for LocationConfig {
             upload_dir: None,
             root: None,
             cgi: HashMap::new(),
+            redirect: None,
         }
     }
 }

@@ -5,6 +5,7 @@ use crate::config::model::ServerConfig;
 use crate::http::request::{parse_request, ParseResult};
 use crate::http::response::HttpResponse;
 use crate::http::methods::{handle_get, handle_head, handle_post, handle_delete};
+use crate::http::session::SessionStore;
 use crate::cgi::executor::execute_cgi;
 use crate::server::listener::accept_connection;
 use crate::utils::error::{ServerError, Result};
@@ -21,6 +22,7 @@ pub struct EventLoop {
     pub connections: HashMap<i32, Connection>,
     pub router: Router,
     pub server_config: Vec<ServerConfig>,
+    pub sessions: SessionStore,
 }
 
 impl EventLoop {
@@ -48,6 +50,7 @@ impl EventLoop {
             connections: HashMap::new(),
             router,
             server_config: configs,
+            sessions: SessionStore::new(),
         })
     }
 
@@ -332,50 +335,69 @@ impl EventLoop {
             .map(|s| s.listen_addr.clone())
             .unwrap_or_default();
 
+        // --- Session handling ---
+        let cookie_header = req.headers.get("cookie").cloned().unwrap_or_default();
+        let session_id = SessionStore::parse_session_id(&cookie_header).unwrap_or_else(|| {
+            self.sessions.create()
+        });
+        // Ensure session exists
+        if self.sessions.get_mut(&session_id).is_none() {
+            self.sessions.create();
+        }
+        let new_session_cookie = format!("session_id={}; Path=/; HttpOnly", session_id);
+
+        // --- Periodic session cleanup ---
+        self.sessions.cleanup();
+
         let resp = match self.router.route(&req, &server_addr) {
             None => HttpResponse::error(404, "No matching route"),
             Some(route) => {
-                // Check method allowed
-                let method_upper = req.method.to_uppercase();
-                if !route.location.methods.contains(&method_upper) {
-                    let allowed = route.location.methods.join(", ");
-                    HttpResponse::error(405, "Method Not Allowed")
-                        .with_header("Allow", &allowed)
+                // Handle redirect first
+                if let Some((redir_code, redir_url)) = &route.location.redirect {
+                    HttpResponse::new(*redir_code)
+                        .with_header("Location", redir_url)
+                        .with_body(Vec::new(), "text/plain")
                 } else {
-                    // Check CGI
-                    let path_ext = Path::new(&req.path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| format!(".{}", e))
-                        .unwrap_or_default();
-
-                    if !route.location.cgi.is_empty() && route.location.cgi.contains_key(&path_ext) {
-                        let interpreter = route.location.cgi[&path_ext].clone();
-                        let root = &route.effective_root;
-                        let rel = req.path.trim_start_matches('/');
-                        let script_path = format!("{}/{}", root, rel);
-                        let server_name = route.server.server_name.clone();
-                        let port = server_addr.split(':').nth(1).unwrap_or("8080").to_string();
-                        execute_cgi(&req, &script_path, &interpreter, &server_name, &port)
+                    // Check method allowed
+                    let method_upper = req.method.to_uppercase();
+                    if !route.location.methods.contains(&method_upper) {
+                        let allowed = route.location.methods.join(", ");
+                        HttpResponse::error(405, "Method Not Allowed")
+                            .with_header("Allow", &allowed)
                     } else {
-                        match method_upper.as_str() {
-                            "GET" => handle_get(&req, route.server, route.location, &route.effective_root),
-                            "HEAD" => handle_head(&req, route.server, route.location, &route.effective_root),
-                            "POST" => handle_post(&req, route.server, route.location, &route.effective_root),
-                            "DELETE" => handle_delete(&req, route.server, route.location, &route.effective_root),
-                            _ => HttpResponse::error(501, "Not Implemented"),
+                        // Check CGI
+                        let path_ext = Path::new(&req.path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| format!(".{}", e))
+                            .unwrap_or_default();
+
+                        if !route.location.cgi.is_empty() && route.location.cgi.contains_key(&path_ext) {
+                            let interpreter = route.location.cgi[&path_ext].clone();
+                            let root = &route.effective_root;
+                            let rel = req.path.trim_start_matches('/');
+                            let script_path = format!("{}/{}", root, rel);
+                            let server_name = route.server.server_name.clone();
+                            let port = server_addr.split(':').nth(1).unwrap_or("8080").to_string();
+                            execute_cgi(&req, &script_path, &interpreter, &server_name, &port)
+                        } else {
+                            match method_upper.as_str() {
+                                "GET" => handle_get(&req, route.server, route.location, &route.effective_root),
+                                "HEAD" => handle_head(&req, route.server, route.location, &route.effective_root),
+                                "POST" => handle_post(&req, route.server, route.location, &route.effective_root),
+                                "DELETE" => handle_delete(&req, route.server, route.location, &route.effective_root),
+                                _ => HttpResponse::error(501, "Not Implemented"),
+                            }
                         }
                     }
                 }
             }
         };
 
-        // Set keep-alive header
-        let resp = if keep_alive {
-            resp.with_header("Connection", "keep-alive")
-        } else {
-            resp.with_header("Connection", "close")
-        };
+        // Set keep-alive and session cookie headers
+        let resp = resp
+            .with_header("Connection", if keep_alive { "keep-alive" } else { "close" })
+            .with_header("Set-Cookie", &new_session_cookie);
 
         let conn = match self.connections.get_mut(&fd) {
             Some(c) => c,

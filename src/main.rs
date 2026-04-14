@@ -20,11 +20,12 @@ extern "C" fn handle_signal(_: libc::c_int) {
 }
 
 fn main() {
-    // Read config
-    let config_content = match std::fs::read_to_string("config.conf") {
+    // Read config path from CLI arg or default to "config.conf"
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.conf".to_string());
+    let config_content = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
         Err(e) => {
-            log_error(&format!("Failed to read config.conf: {}", e));
+            log_error(&format!("Failed to read {}: {}", config_path, e));
             std::process::exit(1);
         }
     };

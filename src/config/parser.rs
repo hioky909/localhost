@@ -180,6 +180,20 @@ fn parse_location(tokens: &[String], mut pos: usize, path: String) -> Result<(Lo
                 }
                 pos += 1;
             }
+            "return" => {
+                pos += 1;
+                if pos < tokens.len() {
+                    let code_str = tokens[pos].trim_end_matches(';');
+                    if let Ok(code) = code_str.parse::<u16>() {
+                        pos += 1;
+                        if pos < tokens.len() {
+                            let url = tokens[pos].trim_end_matches(';').to_string();
+                            loc.redirect = Some((code, url));
+                        }
+                    }
+                }
+                pos += 1;
+            }
             _ => {
                 pos += 1;
             }
