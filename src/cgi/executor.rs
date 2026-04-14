@@ -68,8 +68,15 @@ pub fn execute_cgi(
             env_ptrs.push(std::ptr::null());
 
             // argv: [interpreter, script_path, NULL]
-            let interp_cstr = std::ffi::CString::new(interpreter).unwrap_or_default();
-            let script_cstr = std::ffi::CString::new(script_path).unwrap_or_default();
+            // Use _exit on CString failure to avoid any Rust cleanup in the child
+            let interp_cstr = match std::ffi::CString::new(interpreter) {
+                Ok(s) => s,
+                Err(_) => libc::_exit(1),
+            };
+            let script_cstr = match std::ffi::CString::new(script_path) {
+                Ok(s) => s,
+                Err(_) => libc::_exit(1),
+            };
             let argv: Vec<*const libc::c_char> = vec![
                 interp_cstr.as_ptr(),
                 script_cstr.as_ptr(),

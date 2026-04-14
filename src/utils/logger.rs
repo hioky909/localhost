@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Returns current time as HH:MM:SS in UTC (seconds since Unix epoch modulo 86400).
 fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8,7 +9,7 @@ fn timestamp() -> String {
     let h = (secs % 86400) / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+    format!("{:02}:{:02}:{:02} UTC", h, m, s)
 }
 
 pub fn log_info(msg: &str) {

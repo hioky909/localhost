@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use crate::config::model::{ServerConfig, LocationConfig};
 use crate::utils::error::{ServerError, Result};
+use crate::utils::logger::log_warn;
 
 pub fn parse_config(input: &str) -> Result<Vec<ServerConfig>> {
     let tokens = tokenize(input);
@@ -75,7 +76,7 @@ fn parse_server(tokens: &[String], mut pos: usize) -> Result<(ServerConfig, usiz
                 if pos < tokens.len() {
                     let val = tokens[pos].trim_end_matches(';');
                     config.client_max_body_size = val.parse().unwrap_or_else(|_| {
-                        eprintln!("[WARN] Invalid client_max_body_size '{}', using default 1048576", val);
+                        log_warn(&format!("Invalid client_max_body_size '{}', using default 1048576", val));
                         1048576
                     });
                 }

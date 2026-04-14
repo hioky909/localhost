@@ -275,7 +275,10 @@ impl EventLoop {
                     u64: fd as u64,
                 };
                 unsafe {
-                    libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event);
+                    if libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) < 0 {
+                        let e = std::io::Error::last_os_error();
+                        log_warn(&format!("epoll_ctl MOD (read) failed for fd {}: {}", fd, e));
+                    }
                 }
             } else {
                 self.close_connection(fd);
@@ -394,7 +397,10 @@ impl EventLoop {
             u64: fd as u64,
         };
         unsafe {
-            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event);
+            if libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) < 0 {
+                let e = std::io::Error::last_os_error();
+                crate::utils::logger::log_warn(&format!("epoll_ctl MOD (write) failed for fd {}: {}", fd, e));
+            }
         }
     }
 
