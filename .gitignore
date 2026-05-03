@@ -1,0 +1,52 @@
+# Build & Compilation
+/target
+Cargo.lock
+*.rlib
+*.rmeta
+*.so
+*.dylib
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.exe
+*.pdb
+
+# Python/Test cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Generated files
+*.resolved
+*.log
+test_output.txt
+tests_report.txt
+
+# Debug/Error logs
+cargo_errors.txt
+error.txt
+output.txt
+err.json
+
+# Test artifacts
+www/uploads/upload_*
+*.tmp
+/tmp/
+
+# Cargo cache
+.cargo/
+.rustc_info.json
+target/
+

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>localhost – Page d'accueil</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 3rem 4rem;
+      text-align: center;
+      max-width: 500px;
+    }
+    h1 { font-size: 2.5rem; color: #38bdf8; margin-bottom: .5rem; }
+    p  { color: #94a3b8; margin-top: 1rem; }
+    .badge {
+      display: inline-block;
+      margin-top: 1.5rem;
+      padding: .4rem 1rem;
+      background: #0ea5e9;
+      border-radius: 999px;
+      font-size: .85rem;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🚀 localhost</h1>
+    <p>Serveur HTTP Rust — Zone01 Normandie</p>
+    <p>Le serveur fonctionne correctement !</p>
+    <span class="badge">HTTP/1.1 · epoll · non-blocking I/O</span>
+  </div>
+</body>
+</html>
