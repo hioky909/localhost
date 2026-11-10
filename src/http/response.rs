@@ -16,6 +16,7 @@ pub enum HttpStatus {
     PayloadTooLarge = 413,
     InternalServerError = 500,
     NotImplemented = 501,
+    BadGateway = 502,
     HttpVersionNotSupported = 505,
 }
 
@@ -35,6 +36,7 @@ impl HttpStatus {
             HttpStatus::PayloadTooLarge => "Payload Too Large",
             HttpStatus::InternalServerError => "Internal Server Error",
             HttpStatus::NotImplemented => "Not Implemented",
+            HttpStatus::BadGateway => "Bad Gateway",
             HttpStatus::HttpVersionNotSupported => "HTTP Version Not Supported",
         }
     }

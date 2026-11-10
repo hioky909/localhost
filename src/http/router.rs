@@ -84,7 +84,7 @@ impl Router {
     fn handle_upload(&self, req: &HttpRequest, store: &str) -> HttpResponse {
         // Ensure the store directory exists
         if let Err(e) = std::fs::create_dir_all(store) {
-            eprintln!("Cannot create upload dir {}: {}", store, e);
+            crate::log::error("upload", &format!("cannot create {}: {}", store, e));
             return self.error_response(500);
         }
 
@@ -97,49 +97,62 @@ impl Router {
                 None => return self.error_response(400),
             };
 
-            // Very simple multipart parser: find each part by boundary
-            let delimiter = format!("--{}", boundary);
-            let body_str = String::from_utf8_lossy(&req.body);
-            let mut saved = 0;
-
-            for part in body_str.split(&delimiter) {
-                if part.trim().is_empty() || part.trim() == "--" {
-                    continue;
+            // Analyse multipart au niveau des octets : les fichiers binaires restent intacts.
+            fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+                if needle.is_empty() || from >= hay.len() {
+                    return None;
                 }
-                // Part has headers then double CRLF then content
-                if let Some(headers_end) = part.find("\r\n\r\n") {
-                    let headers_part = &part[..headers_end];
-                    let content_part = &part[headers_end + 4..];
-                    // Remove trailing \r\n before next boundary
-                    let content_part = content_part.trim_end_matches("\r\n");
+                hay[from..].windows(needle.len()).position(|w| w == needle).map(|i| i + from)
+            }
+            let delimiter = format!("--{}", boundary.trim_matches('"')).into_bytes();
+            let body = &req.body[..];
+            let mut saved = 0;
+            let mut pos = match find(body, &delimiter, 0) {
+                Some(p) => p + delimiter.len(),
+                None => return self.error_response(400),
+            };
+            loop {
+                // Fin du message : « --boundary-- »
+                if body[pos..].starts_with(b"--") {
+                    break;
+                }
+                let next = match find(body, &delimiter, pos) {
+                    Some(n) => n,
+                    None => break,
+                };
+                let part = &body[pos..next];
+                pos = next + delimiter.len();
+                let part = part.strip_prefix(b"\r\n").unwrap_or(part);
+                let headers_end = match find(part, b"\r\n\r\n", 0) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let headers_part = String::from_utf8_lossy(&part[..headers_end]);
+                let mut content = &part[headers_end + 4..];
+                content = content.strip_suffix(b"\r\n").unwrap_or(content);
 
-                    // Extract filename from Content-Disposition
-                    let filename = headers_part
-                        .lines()
-                        .find(|l| l.to_lowercase().starts_with("content-disposition"))
-                        .and_then(|l| {
-                            l.split("filename=").nth(1).map(|f| {
-                                f.trim().trim_matches('"').to_string()
-                            })
-                        });
+                let filename = headers_part
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("content-disposition"))
+                    .and_then(|l| l.split("filename=").nth(1).map(|f| f.split(';').next().unwrap_or("").trim().trim_matches('"').to_string()))
+                    .filter(|f| !f.is_empty());
 
-                    let filename = filename.unwrap_or_else(|| {
-                        format!("upload_{}", std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0))
-                    });
+                let filename = filename.unwrap_or_else(|| {
+                    format!("upload_{}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0))
+                });
 
-                    // Sanitize: prevent path traversal
-                    let safe_name = Path::new(&filename)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "upload".to_string());
+                // Sanitize: prevent path traversal
+                let safe_name = Path::new(&filename)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "upload".to_string());
 
-                    let dest = PathBuf::from(store).join(&safe_name);
-                    if std::fs::write(&dest, content_part.as_bytes()).is_ok() {
-                        saved += 1;
-                    }
+                let dest = PathBuf::from(store).join(&safe_name);
+                if std::fs::write(&dest, content).is_ok() {
+                    saved += 1;
                 }
             }
 
@@ -247,7 +260,7 @@ impl Router {
         ) {
             Ok(info) => Err(info),
             Err(e) => {
-                eprintln!("CGI Spawn error: {}", e);
+                crate::log::error("cgi", &format!("spawn failed: {}", e));
                 Ok(self.error_response(500))
             }
         }
@@ -274,35 +287,66 @@ impl Router {
     }
 
     fn serve_directory_listing(&self, path: &Path, uri: &str) -> HttpResponse {
-        let mut entries = String::new();
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        }
+        fn size(n: u64) -> String {
+            if n < 1024 { format!("{} B", n) } else if n < 1024 * 1024 { format!("{:.1} KB", n as f64 / 1024.0) } else { format!("{:.1} MB", n as f64 / 1048576.0) }
+        }
+        fn date(t: std::time::SystemTime) -> String {
+            let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as libc::time_t).unwrap_or(0);
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe { libc::localtime_r(&secs, &mut tm) };
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
+        }
+
+        let mut items: Vec<(bool, String, u64, String)> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(path) {
             for entry in read_dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                let display = if is_dir {
-                    format!("{}/", name)
-                } else {
-                    name.clone()
-                };
-                let href = format!(
-                    "{}/{}{}",
-                    uri.trim_end_matches('/'),
-                    name,
-                    if is_dir { "/" } else { "" }
-                );
-                entries.push_str(&format!(
-                    "  <li><a href=\"{}\">{}</a></li>\n",
-                    href, display
-                ));
+                let meta = entry.metadata().ok();
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified = meta.and_then(|m| m.modified().ok()).map(date).unwrap_or_default();
+                items.push((is_dir, name, len, modified));
             }
+        }
+        // Dossiers d'abord, puis ordre alphabétique
+        items.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+
+        let base = uri.trim_end_matches('/');
+        let mut rows = String::new();
+        if !base.is_empty() {
+            rows.push_str("<tr><td><a href=\"../\">../</a></td><td></td><td></td></tr>\n");
+        }
+        for (is_dir, name, len, modified) in &items {
+            let href = format!("{}/{}{}", base, name, if *is_dir { "/" } else { "" });
+            rows.push_str(&format!(
+                "<tr><td><a href=\"{}\">{}{}</a></td><td>{}</td><td>{}</td></tr>\n",
+                esc(&href),
+                esc(name),
+                if *is_dir { "/" } else { "" },
+                if *is_dir { "—".to_string() } else { size(*len) },
+                modified
+            ));
         }
 
         let html = format!(
-            "<!DOCTYPE html>\n<html>\n<head>\
-            <meta charset=\"utf-8\"><title>Index of {}</title>\n\
-            <style>body{{font-family:monospace;padding:1rem}}li{{margin:.3rem 0}}</style>\
-            </head>\n<body>\n<h1>Index of {}</h1>\n<ul>\n{}</ul>\n</body>\n</html>\n",
-            uri, uri, entries
+            "<!DOCTYPE html>\n<html lang=\"fr\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+            <title>Index de {uri}</title>\n<style>\
+            body{{margin:0;background:#0d0f12;color:#e8e6e3;font:14px/1.6 ui-monospace,'JetBrains Mono',Menlo,monospace}}\
+            main{{max-width:900px;margin:0 auto;padding:48px 28px}}h1{{font-size:22px;margin:0 0 6px}}\
+            p{{color:#8b9099;margin:0 0 24px}}table{{width:100%;border-collapse:collapse}}\
+            th{{text-align:left;color:#8b9099;font-weight:500;border-bottom:1px solid #262a31;padding:8px 10px}}\
+            td{{padding:8px 10px;border-bottom:1px solid #1b1e24}}td:nth-child(2),td:nth-child(3){{color:#8b9099;white-space:nowrap}}\
+            tr:hover td{{background:#15181d}}a{{color:#e8e6e3;text-decoration:none}}a:hover{{color:#ff8a3d}}\
+            footer{{margin-top:28px;color:#4b5059;font-size:12px}}</style>\
+            </head>\n<body><main>\n<h1>Index de {uri}</h1><p>{count} élément(s)</p>\n\
+            <table><thead><tr><th>Nom</th><th>Taille</th><th>Modifié</th></tr></thead><tbody>\n{rows}</tbody></table>\n\
+            <footer>◆ localhost · autoindex</footer></main></body>\n</html>\n",
+            uri = esc(uri),
+            count = items.len(),
+            rows = rows
         );
 
         let mut res = HttpResponse::new(HttpStatus::Ok);
@@ -311,7 +355,6 @@ impl Router {
         res
     }
 
-    /// Build a response for a given error code, using custom error pages if configured
     fn error_response(&self, code: u16) -> HttpResponse {
         let status = match code {
             400 => HttpStatus::BadRequest,
@@ -368,17 +411,15 @@ pub fn spawn_cgi(
     headers: &std::collections::HashMap<String, String>,
     body: &[u8],
 ) -> std::io::Result<CgiInfo> {
-    eprintln!("[CGI] spawn_cgi called for script: {}", script_path);
     
     let mut pipe_in: [c_int; 2] = [0; 2];
     let mut pipe_out: [c_int; 2] = [0; 2];
 
     unsafe {
         if libc::pipe(pipe_in.as_mut_ptr()) < 0 || libc::pipe(pipe_out.as_mut_ptr()) < 0 {
-            eprintln!("[CGI] Failed to create pipes: {}", std::io::Error::last_os_error());
+            crate::log::error("cgi", &format!("pipe() failed: {}", std::io::Error::last_os_error()));
             return Err(std::io::Error::last_os_error());
         }
-        eprintln!("[CGI] Pipes created successfully");
 
         let pid = libc::fork();
         if pid < 0 {
@@ -386,13 +427,12 @@ pub fn spawn_cgi(
             libc::close(pipe_in[1]);
             libc::close(pipe_out[0]);
             libc::close(pipe_out[1]);
-            eprintln!("[CGI] Fork failed: {}", std::io::Error::last_os_error());
+            crate::log::error("cgi", &format!("fork() failed: {}", std::io::Error::last_os_error()));
             return Err(std::io::Error::last_os_error());
         }
 
         if pid == 0 { 
             // Child process
-            eprintln!("[CGI] Child process created (PID: {})", pid);
             libc::close(pipe_in[1]);
             libc::close(pipe_out[0]);
 
@@ -406,6 +446,11 @@ pub fn spawn_cgi(
             envs.push(CString::new(format!("REQUEST_METHOD={}", method).to_uppercase()).unwrap());
             envs.push(CString::new(format!("PATH_INFO={}", path)).unwrap());
             envs.push(CString::new("SERVER_PROTOCOL=HTTP/1.1").unwrap());
+            envs.push(CString::new(format!("SCRIPT_NAME={}", path)).unwrap());
+            envs.push(CString::new(format!("SERVER_SOFTWARE=localhost/{}", env!("CARGO_PKG_VERSION"))).unwrap());
+            // Sans PATH, un shebang « #!/usr/bin/env python3 » ne trouve pas l'interpréteur.
+            let host_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+            envs.push(CString::new(format!("PATH={}", host_path)).unwrap());
             envs.push(CString::new("GATEWAY_INTERFACE=CGI/1.1").unwrap());
             
             if let Some(content_length) = headers.get("content-length") {
@@ -431,20 +476,15 @@ pub fn spawn_cgi(
             let arg0 = CString::new(script_path).unwrap();
             let argv: [*const c_char; 2] = [arg0.as_ptr(), ptr::null()];
 
-            eprintln!("[CGI] Attempting execve for: {}", script_path);
-            eprintln!("[CGI] Method={}, Path={}, Query={}", method, path, query);
             libc::execve(arg0.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            eprintln!("[CGI] execve failed, exiting child with error");
             libc::_exit(1);
         } else {
             // Parent process
-            eprintln!("[CGI] Parent process continuing, child PID: {}", pid);
             libc::close(pipe_in[0]);
             libc::close(pipe_out[1]);
 
             set_nonblocking_cgi(pipe_in[1])?;
             set_nonblocking_cgi(pipe_out[0])?;
-            eprintln!("[CGI] Non-blocking flags set on pipes");
 
             Ok(CgiInfo { pid, stdin_fd: pipe_in[1], stdout_fd: pipe_out[0] })
         }
@@ -461,4 +501,30 @@ fn set_nonblocking_cgi(fd: i32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+
+    #[test]
+    fn upload_multipart_preserve_les_octets() {
+        let dir = std::env::temp_dir().join(format!("lh-test-{}", std::process::id()));
+        let store = dir.to_string_lossy().to_string();
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect(); // octets non UTF-8
+        let mut body = b"--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../bin.dat\"\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"\r\n--XyZ--\r\n");
+        let mut req = HttpRequest::new();
+        req.method = HttpMethod::Post;
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=XyZ".into());
+        req.body = body;
+        let router = Router::new(&ServerConfig::default());
+        let res = router.handle_upload(&req, &store);
+        assert_eq!(res.status, HttpStatus::Created);
+        // Le nom est assaini (pas de sortie du dossier) et le contenu est intact
+        assert_eq!(std::fs::read(dir.join("bin.dat")).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

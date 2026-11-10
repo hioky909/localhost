@@ -62,6 +62,16 @@ impl HttpRequest {
     }
 
     /// Parse a complete request from raw bytes
+    /// En-têtes complets et « Expect: 100-continue » présent : le client attend notre feu vert.
+    pub fn expects_continue(raw: &[u8]) -> bool {
+        let end = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(i) => i,
+            None => return false,
+        };
+        let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+        head.lines().any(|l| l.starts_with("expect:") && l.contains("100-continue"))
+    }
+
     pub fn parse(raw: &[u8]) -> Option<Self> {
         // Find double CRLF which separates headers from body
         let mut headers_end = 0;
@@ -126,6 +136,7 @@ impl HttpRequest {
         let is_chunked = req.headers.get("transfer-encoding").map(|v| v.to_lowercase() == "chunked").unwrap_or(false);
         if is_chunked {
             let mut current_pos = 0;
+            let mut complete = false;
             let mut decoded_body = Vec::new();
             while current_pos < body_bytes.len() {
                 // Find CRLF after chunk size
@@ -137,12 +148,13 @@ impl HttpRequest {
                     size_end += 1;
                 }
                 
-                if size_end >= body_bytes.len() - 1 { break; } // Unexpected end
+                if size_end + 1 >= body_bytes.len() { return None; } // Taille de bloc pas encore reçue
                 
                 let size_str = std::str::from_utf8(&body_bytes[current_pos..size_end]).ok()?;
                 let chunk_size = usize::from_str_radix(size_str.trim(), 16).ok()?;
                 
                 if chunk_size == 0 {
+                    complete = true;
                     break; // End of chunks
                 }
                 
@@ -156,9 +168,21 @@ impl HttpRequest {
                 decoded_body.extend_from_slice(&body_bytes[chunk_start..chunk_end]);
                 current_pos = chunk_end + 2; // +2 for the CRLF after the chunk data
             }
+            if !complete {
+                return None; // Bloc terminal « 0 » pas encore reçu
+            }
             req.body = decoded_body;
         } else {
-            req.body = body_bytes.to_vec();
+            // Attendre tout le corps annoncé par Content-Length (il peut arriver en plusieurs paquets).
+            match req.headers.get("content-length").and_then(|v| v.trim().parse::<usize>().ok()) {
+                Some(expected) => {
+                    if body_bytes.len() < expected {
+                        return None;
+                    }
+                    req.body = body_bytes[..expected].to_vec();
+                }
+                None => req.body = body_bytes.to_vec(),
+            }
         }
 
         // Parse cookies from the "cookie" header
@@ -172,5 +196,32 @@ impl HttpRequest {
         }
 
         Some(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attend_tout_le_corps_annonce() {
+        let partial = b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n12345";
+        assert!(HttpRequest::parse(partial).is_none());
+        let full = b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n1234567890";
+        assert_eq!(HttpRequest::parse(full).unwrap().body, b"1234567890");
+    }
+
+    #[test]
+    fn chunked_incomplet_puis_complet() {
+        let partial = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        assert!(HttpRequest::parse(partial).is_none());
+        let full = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(HttpRequest::parse(full).unwrap().body, b"hello world");
+    }
+
+    #[test]
+    fn detecte_expect_100_continue() {
+        assert!(HttpRequest::expects_continue(b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 9\r\n\r\n"));
+        assert!(!HttpRequest::expects_continue(b"POST / HTTP/1.1\r\nContent-Length: 9\r\n\r\n"));
     }
 }

@@ -60,6 +60,45 @@ target/release/localhost    # Version optimisée
 target/debug/localhost      # Version debug avec symboles
 ```
 
+## 🖥️ Ligne de commande
+
+![Démarrage et journal d'accès](docs/screenshots/demarrage-et-journal.png)
+
+```text
+localhost [commande] [options]
+
+  run       démarre le serveur au premier plan (par défaut)
+  check     vérifie la configuration puis quitte (comme nginx -t)
+  status    affiche l'état d'un serveur en cours d'exécution (--watch : en direct)
+  version   affiche la version
+
+  -c, --config <fichier>   fichier de configuration (défaut : server.conf)
+  -a, --addr <host:port>   serveur à interroger pour status
+      --stats <s>          intervalle de la ligne de statistiques (0 = désactivée)
+      --no-color           désactive les couleurs (aussi via NO_COLOR)
+```
+
+- **Bannière de démarrage** : configuration validée, pid, modèle d'exécution, sockets d'écoute et hôtes virtuels.
+- **Journal d'accès** coloré, une ligne par requête : heure, méthode, statut, chemin, taille, durée mesurée, client, hôte virtuel. Les exécutions CGI apparaissent avec leur pid, leur code de sortie et leur durée.
+- **Ligne de statistiques** périodique (débit, taux de succès, latence p95, connexions actives).
+- **Arrêt propre** sur `Ctrl+C` / `SIGTERM` : fermeture des sockets puis bilan de session (requêtes, statuts, percentiles, transferts, CGI, uploads, timeouts).
+- **`localhost check`** : syntaxe, résumé des blocs `server` et des `location`, avertissements (racine absente, page d'erreur manquante) et erreurs bloquantes (port déclaré deux fois dans un bloc…).
+- **`localhost status --watch`** : tableau de bord en direct alimenté par `GET /__localhost/status` (JSON, réservé aux clients 127.0.0.0/8) ; la page d'accueil l'utilise aussi.
+
+| `status --watch` | `check` | Arrêt et bilan |
+|---|---|---|
+| ![status](docs/screenshots/status-watch.png) | ![check](docs/screenshots/check.png) | ![bilan](docs/screenshots/arret-et-bilan.png) |
+
+Toutes les valeurs affichées proviennent des compteurs réels de la boucle d'événements. Pour une démonstration : `python3 scripts/traffic.py` génère un trafic varié (pages, CGI, uploads/suppressions, 404, 405, 413, 501).
+
+### Corrections apportées en v1.0
+
+- **CGI** : le script recevait un environnement sans `PATH` (échec des shebangs `#!/usr/bin/env python3`) et la fin du pipe (`EPOLLHUP`) n'était pas traitée — la connexion restait bloquée jusqu'au timeout. Un script qui échoue renvoie désormais `502 Bad Gateway`, et un CGI dont le client expire est arrêté proprement.
+- **Corps de requête** : le serveur attend tout le corps annoncé par `Content-Length` (ou le bloc terminal en `chunked`) au lieu de traiter un corps tronqué ; réponse `100 Continue` quand le client la demande.
+- **Upload** : le multipart est analysé au niveau des octets — les fichiers binaires (images, PDF) ne sont plus corrompus.
+- **Hôtes virtuels** : plusieurs blocs `server` peuvent partager un même `host:port` ; le bloc est choisi d'après l'en-tête `Host`.
+- Listing de dossier (tailles, dates, noms échappés) et pages d'erreur repensés.
+
 ## 📖 Utilisation
 
 ### Lancer le Serveur

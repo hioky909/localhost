@@ -3,45 +3,94 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>localhost – Page d'accueil</title>
+  <title>localhost — serveur HTTP/1.1</title>
   <style>
+    :root { --bg:#0d0f12; --panel:#15181d; --line:#262a31; --ink:#e8e6e3; --mute:#8b9099; --brand:#ff8a3d; --ok:#4ade80; --info:#60a5fa; --warn:#fbbf24; --err:#f87171; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Segoe UI', sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 12px;
-      padding: 3rem 4rem;
-      text-align: center;
-      max-width: 500px;
-    }
-    h1 { font-size: 2.5rem; color: #38bdf8; margin-bottom: .5rem; }
-    p  { color: #94a3b8; margin-top: 1rem; }
-    .badge {
-      display: inline-block;
-      margin-top: 1.5rem;
-      padding: .4rem 1rem;
-      background: #0ea5e9;
-      border-radius: 999px;
-      font-size: .85rem;
-      color: #fff;
-    }
+    body { font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--ink); min-height: 100vh; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 64px 28px; }
+    .brand { display: flex; align-items: center; gap: 12px; font: 600 15px ui-monospace, 'JetBrains Mono', Menlo, monospace; color: var(--brand); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 4px rgba(74,222,128,.15); animation: pulse 2s infinite; }
+    h1 { font-size: 46px; letter-spacing: -0.03em; line-height: 1.05; margin: 28px 0 14px; }
+    h1 span { color: var(--brand); }
+    .lead { color: var(--mute); font-size: 18px; max-width: 640px; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 40px 0 18px; }
+    .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
+    .kpi b { display: block; font: 600 28px ui-monospace, Menlo, monospace; letter-spacing: -0.02em; }
+    .kpi small { color: var(--mute); }
+    .bars { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; display: grid; gap: 10px; }
+    .row { display: grid; grid-template-columns: 44px 1fr 70px; align-items: center; gap: 14px; font: 13px ui-monospace, Menlo, monospace; }
+    .track { height: 8px; background: #20242b; border-radius: 6px; overflow: hidden; }
+    .track i { display: block; height: 100%; border-radius: 6px; transition: width .6s cubic-bezier(.22,1,.36,1); }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; }
+    .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--mute); margin-bottom: 12px; }
+    code, .mono { font: 13px ui-monospace, 'JetBrains Mono', Menlo, monospace; }
+    ul { list-style: none; display: grid; gap: 8px; }
+    li a { color: var(--ink); text-decoration: none; border-bottom: 1px dashed #3a3f48; }
+    li a:hover { color: var(--brand); border-color: var(--brand); }
+    .m { display: inline-block; width: 62px; font-weight: 700; }
+    .get { color: #22d3ee; } .post { color: var(--warn); } .del { color: var(--err); }
+    footer { margin-top: 36px; color: var(--mute); font-size: 13px; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(74,222,128,0); } }
+    @media (max-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } .cols { grid-template-columns: 1fr; } h1 { font-size: 34px; } }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>🚀 localhost</h1>
-    <p>Serveur HTTP Rust — Zone01 Normandie</p>
-    <p>Le serveur fonctionne correctement !</p>
-    <span class="badge">HTTP/1.1 · epoll · non-blocking I/O</span>
-  </div>
+  <main class="wrap">
+    <div class="brand"><span class="dot"></span> ◆ localhost <span id="ver" style="color:var(--mute)"></span></div>
+    <h1>Le serveur répond.<br><span>Tout est en ordre.</span></h1>
+    <p class="lead">Serveur HTTP/1.1 écrit en Rust : une boucle d'événements <code>epoll</code>, des E/S non bloquantes, du CGI par pipes. Les chiffres ci-dessous sont lus en direct sur <code>/__localhost/status</code>.</p>
+
+    <section class="grid">
+      <div class="kpi"><b id="req">—</b><small>requêtes servies</small></div>
+      <div class="kpi"><b id="p95">—</b><small>latence p95</small></div>
+      <div class="kpi"><b id="act">—</b><small>connexions actives</small></div>
+      <div class="kpi"><b id="up">—</b><small>en ligne depuis</small></div>
+    </section>
+
+    <section class="bars" id="bars"></section>
+
+    <section class="cols">
+      <div class="panel">
+        <h2>Essayer</h2>
+        <ul class="mono">
+          <li><span class="m get">GET</span><a href="/upload/">/upload/</a> <span style="color:var(--mute)">— listing des fichiers</span></li>
+          <li><span class="m get">GET</span><a href="/cgi-bin/test.py?nom=visiteur">/cgi-bin/test.py</a> <span style="color:var(--mute)">— script CGI</span></li>
+          <li><span class="m get">GET</span><a href="/redirect_test">/redirect_test</a> <span style="color:var(--mute)">— redirection 301</span></li>
+          <li><span class="m get">GET</span><a href="/introuvable">/introuvable</a> <span style="color:var(--mute)">— page 404</span></li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h2>En ligne de commande</h2>
+        <ul class="mono" style="color:var(--mute)">
+          <li><span style="color:var(--brand)">$</span> localhost check</li>
+          <li><span style="color:var(--brand)">$</span> localhost status --watch</li>
+          <li><span style="color:var(--brand)">$</span> curl -F file=@note.txt :8080/upload</li>
+          <li><span style="color:var(--brand)">$</span> curl -X DELETE :8080/upload/note.txt</li>
+        </ul>
+      </div>
+    </section>
+    <footer>Zone01 Normandie · Rust · dépendance unique : libc</footer>
+  </main>
+  <script>
+    const fmt = (us) => us < 1000 ? us + ' µs' : (us / 1000).toFixed(2) + ' ms';
+    const up = (s) => s >= 3600 ? Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min' : s >= 60 ? Math.floor(s / 60) + ' min ' + (s % 60) + ' s' : s + ' s';
+    const classes = [['2xx', 's2xx', 'var(--ok)'], ['3xx', 's3xx', 'var(--info)'], ['4xx', 's4xx', 'var(--warn)'], ['5xx', 's5xx', 'var(--err)']];
+    async function refresh() {
+      try {
+        const s = await (await fetch('/__localhost/status', { cache: 'no-store' })).json();
+        document.getElementById('ver').textContent = 'v' + s.version + ' · pid ' + s.pid;
+        document.getElementById('req').textContent = s.requests.toLocaleString('fr-FR');
+        document.getElementById('p95').textContent = fmt(s.p95_us);
+        document.getElementById('act').textContent = s.active;
+        document.getElementById('up').textContent = up(s.uptime_s);
+        const max = Math.max(1, ...classes.map(([, k]) => s[k]));
+        document.getElementById('bars').innerHTML = classes.map(([label, k, color]) =>
+          `<div class="row"><span style="color:${color};font-weight:700">${label}</span><span class="track"><i style="width:${s[k] / max * 100}%;background:${color}"></i></span><span style="text-align:right;color:var(--mute)">${s[k]}</span></div>`).join('');
+      } catch (e) { /* statut indisponible (accès non local) */ }
+    }
+    refresh(); setInterval(refresh, 2000);
+  </script>
 </body>
 </html>

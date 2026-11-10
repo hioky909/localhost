@@ -30,10 +30,20 @@ pub struct Client {
     pub cgi_pid: Option<i32>,
     pub cgi_stdin_fd: Option<i32>,
     pub cgi_stdout_fd: Option<i32>,
+    /// Adresse du client (ip:port), pour le journal.
+    pub peer: String,
+    /// Premier octet reçu : début de la mesure de durée.
+    pub started_at: Option<std::time::Instant>,
+    /// Requête interne (/__localhost/status) : ni journalisée ni comptée.
+    pub internal: bool,
+    /// Socket d'écoute qui a accepté la connexion (sélection de l'hôte virtuel).
+    pub listener_fd: RawFd,
+    /// « 100 Continue » déjà envoyé pour cette requête.
+    pub sent_continue: bool,
 }
 
 impl Client {
-    pub fn new(fd: RawFd, server_config: ServerConfig) -> Self {
+    pub fn new(fd: RawFd, server_config: ServerConfig, peer: String) -> Self {
         Self {
             fd,
             state: ClientState::ReadingRequest,
@@ -47,7 +57,47 @@ impl Client {
             cgi_pid: None,
             cgi_stdin_fd: None,
             cgi_stdout_fd: None,
+            peer,
+            started_at: None,
+            internal: false,
+            listener_fd: -1,
+            sent_continue: false,
         }
+    }
+
+    /// Code de statut réellement envoyé (lu sur la ligne d'état de la réponse).
+    pub fn status_code(&self) -> u16 {
+        let head = &self.write_buffer[..self.write_buffer.len().min(16)];
+        std::str::from_utf8(head)
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Méthode et chemin, y compris pour une requête rejetée avant d'être analysée (413…).
+    pub fn method_and_path(&self) -> (String, String) {
+        if let Some(req) = &self.request {
+            let m = match &req.method {
+                crate::http::request::HttpMethod::Get => "GET".to_string(),
+                crate::http::request::HttpMethod::Post => "POST".to_string(),
+                crate::http::request::HttpMethod::Delete => "DELETE".to_string(),
+                crate::http::request::HttpMethod::Unknown(x) => x.clone(),
+            };
+            let path = if req.query.is_empty() { req.path.clone() } else { format!("{}?{}", req.path, req.query) };
+            return (m, path);
+        }
+        let head = &self.read_buffer[..self.read_buffer.len().min(512)];
+        let line = String::from_utf8_lossy(head);
+        let mut parts = line.lines().next().unwrap_or("").split_whitespace();
+        (parts.next().unwrap_or("-").to_string(), parts.next().unwrap_or("-").to_string())
+    }
+
+    pub fn host(&self) -> String {
+        self.request
+            .as_ref()
+            .and_then(|r| r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone()))
+            .unwrap_or_else(|| self.server_config.server_names.first().cloned().unwrap_or_default())
     }
 
     pub fn read_data(&mut self) -> std::io::Result<bool> {
@@ -61,6 +111,9 @@ impl Client {
                 return Ok(true);
             }
             Ok(n) => {
+                if self.started_at.is_none() {
+                    self.started_at = Some(std::time::Instant::now());
+                }
                 self.read_buffer.extend_from_slice(&buf[0..n]);
                 self.last_activity = std::time::Instant::now(); // Update activity
                 
@@ -68,7 +121,6 @@ impl Client {
                 if let Some(max_size) = self.server_config.client_max_body_size {
                     if self.read_buffer.len() > max_size {
                         // Send 413 Payload Too Large response
-                        eprintln!("[SIZE] Body limit exceeded: {} > {}", self.read_buffer.len(), max_size);
                         let mut res = HttpResponse::new(HttpStatus::PayloadTooLarge);
                         res.set_header("Content-Length", "0");
                         self.write_buffer = res.to_bytes();
@@ -83,6 +135,11 @@ impl Client {
                     self.state = ClientState::Processing;
                     std::mem::forget(file);
                     return Ok(true);
+                }
+                if !self.sent_continue && HttpRequest::expects_continue(&self.read_buffer) {
+                    // curl & co. attendent ce feu vert avant d'envoyer un corps volumineux.
+                    let _ = file.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    self.sent_continue = true;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
