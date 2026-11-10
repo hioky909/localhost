@@ -196,7 +196,8 @@ localhost/
 │       ├── reactor.rs        # Wrapper epoll (add/modify/remove/wait)
 │       └── client.rs         # Machine à états par client (ReadingRequest→WritingResponse)
 ├── tests/
-│   ├── run_tests.py          # Suite de test automatisée (17 catégories)
+│   ├── serveur.rs            # 24 tests de bout en bout (cargo test, vrai binaire)
+│   ├── run_tests.py          # Suite d'audit Python (17 catégories)
 │   └── configs/              # Configurations de test
 ├── www/
 │   ├── index.html            # Page d'accueil
@@ -259,13 +260,28 @@ ReadingRequest ──→ Processing ──→ {WritingResponse, CgiXxx} ──�
 
 ## 🧪 Tests
 
-Le projet inclut une suite de test complète (17 catégories, 24+ tests) :
+Trois niveaux de tests, **206 au total** :
+
+| Niveau | Nombre | Lancement |
+|---|---|---|
+| Tests unitaires Rust (dans chaque module) | 158 | `cargo test` |
+| Tests de bout en bout Rust (`tests/serveur.rs`) : le vrai binaire démarré sur un port libre, interrogé en HTTP brut | 24 | `cargo test` |
+| Suite d'audit Python | 24 | `python3 tests/run_tests.py 127.0.0.1 8080` (serveur lancé) |
 
 ```bash
-# Compiler et lancer les tests
-cargo build
+cargo test                                   # 182 tests Rust
+cargo run --release -- run &                 # puis la suite d'audit
 python3 tests/run_tests.py 127.0.0.1 8080
 ```
+
+Couverts par les tests Rust : analyseur de configuration (directives, erreurs, blocs non fermés), parsing HTTP
+(Content-Length, chunked, cookies, 100-continue, requêtes malformées), routeur (route la plus longue, 405/501/413,
+redirections, autoindex échappé, pages d'erreur, uploads multipart binaires, DELETE, CGI réel), sécurité
+(remontée de dossier `../` refusée en lecture et en suppression), machine à états client sur de vraies sockets,
+boucle epoll, statistiques et percentiles, rendu terminal, commandes `check` / `version`, hôtes virtuels,
+multi-ports, clients lents, 20 connexions simultanées, arrêt propre sur SIGTERM.
+
+### Suite d'audit Python
 
 ### Couverture de Tests
 

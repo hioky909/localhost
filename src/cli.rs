@@ -532,4 +532,120 @@ mod tests {
         assert_eq!(num(j, "requests"), 42);
         assert_eq!(text(j, "listeners"), "127.0.0.1:8080,127.0.0.1:8081");
     }
+
+    fn cfg(src: &str) -> Config {
+        Config::load_string(src).unwrap()
+    }
+
+    #[test]
+    fn aucun_bloc_server_est_une_erreur() {
+        let (errors, _) = validate(&cfg(""));
+        assert_eq!(errors, vec!["aucun bloc server".to_string()]);
+    }
+
+    #[test]
+    fn bloc_sans_listen_est_une_erreur() {
+        let (errors, _) = validate(&cfg("server { server_name api; }"));
+        assert_eq!(errors, vec!["api : aucune directive listen".to_string()]);
+    }
+
+    #[test]
+    fn bloc_anonyme_designe_par_son_numero() {
+        let (errors, _) = validate(&cfg("server { listen 1; } server { }"));
+        assert!(errors.iter().any(|e| e.starts_with("server #2")));
+    }
+
+    #[test]
+    fn meme_adresse_et_meme_nom_refuses() {
+        let (errors, _) = validate(&cfg("server { listen 8095; server_name a; } server { listen 8095; server_name a; }"));
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("127.0.0.1:8095"));
+    }
+
+    #[test]
+    fn second_bloc_sans_nom_sur_une_adresse_deja_prise() {
+        let (errors, _) = validate(&cfg("server { listen 8096; server_name a; } server { listen 8096; }"));
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn meme_port_sur_deux_hotes_differents_accepte() {
+        let (errors, _) = validate(&cfg("server { listen 8097; host 127.0.0.1; } server { listen 8097; host 127.0.0.2; }"));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn avertissements_pour_chemins_absents() {
+        let (errors, warnings) = validate(&cfg(
+            "server { listen 1; server_name w; error_page 404 /nulle/part.html;
+              location / { root /dossier/inexistant; }
+              location /up { upload_store /depot/inexistant; } }",
+        ));
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|w| w.contains("page d'erreur 404 introuvable")));
+        assert!(warnings.iter().any(|w| w.contains("racine /dossier/inexistant inexistante")));
+        assert!(warnings.iter().any(|w| w.contains("sera créé au premier upload")));
+    }
+
+    #[test]
+    fn redirection_sans_avertissement_de_racine() {
+        let (_, warnings) = validate(&cfg("server { listen 1; location / { root /inexistant; return /ailleurs; } }"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn configuration_du_depot_sans_erreur() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/server.conf");
+        let (errors, _) = validate(&Config::load_file(path).unwrap());
+        assert!(errors.is_empty(), "{:?}", errors);
+    }
+
+    #[test]
+    fn description_des_routes() {
+        let c = cfg("server { listen 1; location /a { allow_methods GET DELETE; root www; index i.html; autoindex on; }
+                     location /b { return /c; } location /d { cgi_extension .py; upload_store up; } }");
+        let r = &c.servers[0].routes;
+        assert_eq!(methods(&r[0]), "GET DELETE");
+        assert_eq!(route_kind(&r[0]), "root www  ·  index i.html  ·  autoindex");
+        assert_eq!(route_kind(&r[1]), "301 → /c");
+        assert_eq!(route_kind(&r[2]), "cgi .py  ·  upload → up");
+    }
+
+    #[test]
+    fn sparkline_proportionnelle() {
+        assert_eq!(sparkline(&[0.0, 1.0, 2.0, 7.0]), "▁▂▃█");
+        assert_eq!(sparkline(&[5.0, 5.0]), "██");
+    }
+
+    #[test]
+    fn sparkline_vide_ou_nulle() {
+        assert_eq!(sparkline(&[]), "");
+        assert_eq!(sparkline(&[0.0, 0.0, 0.0]), "▁▁▁");
+    }
+
+    #[test]
+    fn lecture_json_robuste() {
+        let j = r#"{"a":1,"b": 22 ,"c":"x","d":-3,"z":9}"#;
+        assert_eq!(num(j, "b"), 22);
+        assert_eq!(num(j, "z"), 9);
+        assert_eq!(num(j, "absent"), 0);
+        assert_eq!(num(j, "c"), 0); // valeur texte : pas un nombre
+        assert_eq!(num(j, "d"), 0); // compteur négatif impossible : ignoré
+        assert_eq!(text(j, "c"), "x");
+        assert_eq!(text(j, "absent"), "");
+    }
+
+    #[test]
+    fn lit_le_json_produit_par_les_statistiques() {
+        let mut s = crate::stats::Stats::new();
+        s.record("GET", 200, 120, 0, 512);
+        s.record("GET", 500, 80, 0, 0);
+        let j = s.to_json(VERSION, 7, &["127.0.0.1:8080".into()]);
+        assert_eq!(num(&j, "requests"), 2);
+        assert_eq!(num(&j, "s5xx"), 1);
+        assert_eq!(num(&j, "bytes_out"), 512);
+        assert_eq!(text(&j, "version"), VERSION);
+        assert_eq!(text(&j, "listeners"), "127.0.0.1:8080");
+    }
 }

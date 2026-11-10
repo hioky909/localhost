@@ -48,9 +48,11 @@ fn tokenize(content: &str) -> impl Iterator<Item = String> + '_ {
 fn parse_server(tokens: &mut impl Iterator<Item = String>) -> Result<ServerConfig, ConfigError> {
     expect_token(tokens, "{")?;
     let mut server = ServerConfig::default();
+    let mut closed = false;
 
     while let Some(token) = tokens.next() {
         if token == "}" {
+            closed = true;
             break;
         }
 
@@ -98,6 +100,9 @@ fn parse_server(tokens: &mut impl Iterator<Item = String>) -> Result<ServerConfi
         }
     }
 
+    if !closed {
+        return Err(ConfigError::ParseError("Unclosed server block: expected '}', found EOF".to_string()));
+    }
     Ok(server)
 }
 
@@ -105,9 +110,11 @@ fn parse_location(tokens: &mut impl Iterator<Item = String>) -> Result<RouteConf
     let mut route = RouteConfig::default();
     route.path = expect_value(tokens)?;
     expect_token(tokens, "{")?;
+    let mut closed = false;
 
     while let Some(token) = tokens.next() {
         if token == "}" {
+            closed = true;
             break;
         }
 
@@ -153,6 +160,9 @@ fn parse_location(tokens: &mut impl Iterator<Item = String>) -> Result<RouteConf
         }
     }
 
+    if !closed {
+        return Err(ConfigError::ParseError(format!("Unclosed location block '{}': expected '}}', found EOF", route.path)));
+    }
     Ok(route)
 }
 
@@ -169,5 +179,193 @@ fn expect_value(tokens: &mut impl Iterator<Item = String>) -> Result<String, Con
         Some(t) if t == ";" || t == "{" || t == "}" => Err(ConfigError::ParseError(format!("Expected value, found '{}'", t))),
         Some(t) => Ok(t),
         None => Err(ConfigError::ParseError("Expected value, found EOF".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> Config {
+        parse_string(src).expect("configuration valide")
+    }
+
+    fn err(src: &str) -> String {
+        match parse_string(src) {
+            Err(ConfigError::ParseError(m)) => m,
+            Err(ConfigError::Io(e)) => panic!("erreur d'E/S inattendue : {}", e),
+            Ok(_) => panic!("la configuration aurait dû être refusée : {}", src),
+        }
+    }
+
+    #[test]
+    fn configuration_vide_donne_zero_serveur() {
+        assert!(parse("").servers.is_empty());
+        assert!(parse("   \n\t  ").servers.is_empty());
+    }
+
+    #[test]
+    fn bloc_minimal_avec_valeurs_par_defaut() {
+        let cfg = parse("server { listen 8080; }");
+        assert_eq!(cfg.servers.len(), 1);
+        let s = &cfg.servers[0];
+        assert_eq!(s.ports, vec![8080]);
+        assert_eq!(s.host, "127.0.0.1");
+        assert_eq!(s.timeout, Some(30));
+        assert_eq!(s.client_max_body_size, None);
+        assert!(s.routes.is_empty());
+    }
+
+    #[test]
+    fn toutes_les_directives_serveur() {
+        let cfg = parse(
+            "server {
+                listen 8080; listen 8081;
+                host 0.0.0.0;
+                server_name exemple.local www.exemple.local;
+                error_page 404 www/404.html;
+                error_page 500 www/500.html;
+                client_max_body_size 1048576;
+                timeout 5;
+            }",
+        );
+        let s = &cfg.servers[0];
+        assert_eq!(s.ports, vec![8080, 8081]);
+        assert_eq!(s.host, "0.0.0.0");
+        assert_eq!(s.server_names, vec!["exemple.local", "www.exemple.local"]);
+        assert_eq!(s.error_pages.get(&404).map(String::as_str), Some("www/404.html"));
+        assert_eq!(s.error_pages.get(&500).map(String::as_str), Some("www/500.html"));
+        assert_eq!(s.client_max_body_size, Some(1_048_576));
+        assert_eq!(s.timeout, Some(5));
+    }
+
+    #[test]
+    fn toutes_les_directives_location() {
+        let cfg = parse(
+            "server { listen 1; location /app {
+                allow_methods GET post;
+                root www/app; index home.html; autoindex on;
+                cgi_extension .py; upload_store uploads;
+            } location /ancien { return /nouveau; } }",
+        );
+        let r = &cfg.servers[0].routes[0];
+        assert_eq!(r.path, "/app");
+        assert_eq!(r.accepted_methods, vec![HttpMethod::Get, HttpMethod::Post]);
+        assert_eq!(r.root_directory.as_deref(), Some("www/app"));
+        assert_eq!(r.index_file.as_deref(), Some("home.html"));
+        assert!(r.directory_listing);
+        assert_eq!(r.cgi_extension.as_deref(), Some(".py"));
+        assert_eq!(r.upload_store.as_deref(), Some("uploads"));
+        assert_eq!(cfg.servers[0].routes[1].redirection.as_deref(), Some("/nouveau"));
+    }
+
+    #[test]
+    fn methodes_par_defaut_get_post_delete() {
+        let r = &parse("server { listen 1; location / { root www; } }").servers[0].routes[0];
+        assert_eq!(r.accepted_methods, vec![HttpMethod::Get, HttpMethod::Post, HttpMethod::Delete]);
+        assert!(!r.directory_listing);
+    }
+
+    #[test]
+    fn autoindex_off_et_valeur_inconnue_desactivent_le_listing() {
+        let cfg = parse("server { listen 1; location /a { autoindex off; } location /b { autoindex oui; } }");
+        assert!(!cfg.servers[0].routes[0].directory_listing);
+        assert!(!cfg.servers[0].routes[1].directory_listing);
+    }
+
+    #[test]
+    fn plusieurs_blocs_server() {
+        let cfg = parse("server { listen 1; server_name a; } server { listen 2; server_name b; }");
+        assert_eq!(cfg.servers.len(), 2);
+        assert_eq!(cfg.servers[1].server_names, vec!["b"]);
+    }
+
+    #[test]
+    fn tolere_les_espacements_compacts() {
+        let cfg = parse("server{listen 8080;location /{root www;}}");
+        assert_eq!(cfg.servers[0].ports, vec![8080]);
+        assert_eq!(cfg.servers[0].routes[0].root_directory.as_deref(), Some("www"));
+    }
+
+    #[test]
+    fn refuse_un_bloc_racine_inconnu() {
+        assert!(err("http { }").contains("Expected 'server'"));
+    }
+
+    #[test]
+    fn refuse_une_directive_serveur_inconnue() {
+        assert!(err("server { listen 1; gzip on; }").contains("Unknown server directive: gzip"));
+    }
+
+    #[test]
+    fn refuse_une_directive_location_inconnue() {
+        assert!(err("server { listen 1; location / { proxy_pass x; } }").contains("Unknown location directive"));
+    }
+
+    #[test]
+    fn refuse_un_port_invalide() {
+        assert!(err("server { listen abc; }").contains("Invalid port"));
+        assert!(err("server { listen 70000; }").contains("Invalid port"));
+        assert!(err("server { listen -1; }").contains("Invalid port"));
+    }
+
+    #[test]
+    fn refuse_les_valeurs_numeriques_invalides() {
+        assert!(err("server { listen 1; error_page abc x; }").contains("Invalid status code"));
+        assert!(err("server { listen 1; client_max_body_size 10M; }").contains("Invalid size"));
+        assert!(err("server { listen 1; timeout -5; }").contains("Invalid timeout"));
+    }
+
+    #[test]
+    fn refuse_une_methode_inconnue() {
+        assert!(err("server { listen 1; location / { allow_methods GET PUT; } }").contains("Unknown method: PUT"));
+    }
+
+    #[test]
+    fn exige_le_point_virgule() {
+        assert!(err("server { listen 8080 host 0.0.0.0; }").contains("Expected ';'"));
+    }
+
+    #[test]
+    fn exige_une_valeur() {
+        assert!(err("server { listen ; }").contains("Expected value"));
+        assert!(err("server { location { } }").contains("Expected value"));
+    }
+
+    #[test]
+    fn exige_l_accolade_ouvrante() {
+        assert!(err("server listen 1;").contains("Expected '{'"));
+    }
+
+    #[test]
+    fn refuse_un_bloc_server_non_ferme() {
+        assert!(err("server { listen 8080;").contains("Unclosed server block"));
+    }
+
+    #[test]
+    fn refuse_un_bloc_location_non_ferme() {
+        assert!(err("server { listen 1; location /a { root www;").contains("Unclosed location block '/a'"));
+    }
+
+    #[test]
+    fn fichier_absent_donne_une_erreur_d_entree_sortie() {
+        assert!(matches!(parse_file("/chemin/qui/n/existe/pas.conf"), Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn lit_un_fichier_sur_disque() {
+        let path = std::env::temp_dir().join(format!("lh-conf-{}.conf", std::process::id()));
+        std::fs::write(&path, "server { listen 9000; server_name fichier; }").unwrap();
+        let cfg = parse_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.servers[0].server_names, vec!["fichier"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn la_configuration_du_depot_est_valide() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/server.conf");
+        let cfg = parse_file(path).expect("server.conf doit rester valide");
+        assert!(!cfg.servers.is_empty());
+        assert!(cfg.servers.iter().all(|s| !s.ports.is_empty()));
     }
 }

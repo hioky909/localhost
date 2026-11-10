@@ -94,3 +94,112 @@ impl Drop for Reactor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tube() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    fn fermer(fds: &[RawFd]) {
+        for &fd in fds {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    fn evenements(r: &Reactor, timeout: c_int) -> Vec<(u32, u64)> {
+        let mut ev = vec![unsafe { std::mem::zeroed::<epoll_event>() }; 8];
+        let n = r.wait(&mut ev, timeout).unwrap();
+        ev[..n].iter().map(|e| (e.events, e.u64)).collect()
+    }
+
+    #[test]
+    fn aucun_evenement_avant_le_timeout() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(lec, libc::EPOLLIN as u32, 7).unwrap();
+        assert!(evenements(&r, 10).is_empty());
+        fermer(&[lec, ecr]);
+    }
+
+    #[test]
+    fn signale_les_donnees_disponibles_avec_la_cle_utilisateur() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(lec, libc::EPOLLIN as u32, 42).unwrap();
+        assert_eq!(unsafe { libc::write(ecr, b"x".as_ptr() as *const _, 1) }, 1);
+        let ev = evenements(&r, 100);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, 42);
+        assert!(ev[0].0 & libc::EPOLLIN as u32 != 0);
+        fermer(&[lec, ecr]);
+    }
+
+    #[test]
+    fn modify_change_les_interets() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(ecr, libc::EPOLLIN as u32, 1).unwrap();
+        assert!(evenements(&r, 10).is_empty()); // un tube n'est jamais lisible côté écriture
+        r.modify(ecr, libc::EPOLLOUT as u32, 2).unwrap();
+        let ev = evenements(&r, 100);
+        assert_eq!(ev, vec![(libc::EPOLLOUT as u32, 2)]);
+        fermer(&[lec, ecr]);
+    }
+
+    #[test]
+    fn remove_arrete_la_surveillance_et_tolere_un_double_retrait() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(lec, libc::EPOLLIN as u32, 1).unwrap();
+        r.remove(lec).unwrap();
+        unsafe { libc::write(ecr, b"x".as_ptr() as *const _, 1) };
+        assert!(evenements(&r, 10).is_empty());
+        r.remove(lec).unwrap(); // ENOENT ignoré
+        fermer(&[lec, ecr]);
+    }
+
+    #[test]
+    fn fermeture_de_l_autre_extremite_signalee() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(lec, libc::EPOLLIN as u32, 3).unwrap();
+        fermer(&[ecr]);
+        let ev = evenements(&r, 100);
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].0 & libc::EPOLLHUP as u32 != 0);
+        fermer(&[lec]);
+    }
+
+    #[test]
+    fn erreurs_du_systeme_remontees() {
+        let r = Reactor::new().unwrap();
+        let (lec, ecr) = tube();
+        r.add(lec, libc::EPOLLIN as u32, 1).unwrap();
+        assert!(r.add(lec, libc::EPOLLIN as u32, 1).is_err()); // EEXIST
+        assert!(r.modify(ecr, libc::EPOLLOUT as u32, 1).is_err()); // ENOENT : jamais ajouté
+        assert!(r.add(-1, libc::EPOLLIN as u32, 1).is_err()); // EBADF
+        fermer(&[lec, ecr]);
+    }
+
+    #[test]
+    fn plusieurs_descripteurs_surveilles() {
+        let r = Reactor::new().unwrap();
+        let (l1, e1) = tube();
+        let (l2, e2) = tube();
+        r.add(l1, libc::EPOLLIN as u32, 1).unwrap();
+        r.add(l2, libc::EPOLLIN as u32, 2).unwrap();
+        unsafe {
+            libc::write(e1, b"a".as_ptr() as *const _, 1);
+            libc::write(e2, b"b".as_ptr() as *const _, 1);
+        }
+        let mut cles: Vec<u64> = evenements(&r, 100).into_iter().map(|e| e.1).collect();
+        cles.sort();
+        assert_eq!(cles, vec![1, 2]);
+        fermer(&[l1, e1, l2, e2]);
+    }
+}

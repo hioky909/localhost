@@ -194,6 +194,12 @@ impl Router {
         let suffix = req.path.strip_prefix(&route.path).unwrap_or("");
         let suffix = suffix.trim_start_matches('/');
 
+        // Sécurité : un segment « .. » sortirait de la racine (lecture ou suppression de
+        // fichiers arbitraires). Refusé comme le fait nginx (400).
+        if Path::new(suffix).components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+            return Ok(self.error_response(400));
+        }
+
         let mut fs_path = PathBuf::from(&root);
         if !suffix.is_empty() {
             fs_path.push(suffix);
@@ -356,16 +362,7 @@ impl Router {
     }
 
     fn error_response(&self, code: u16) -> HttpResponse {
-        let status = match code {
-            400 => HttpStatus::BadRequest,
-            403 => HttpStatus::Forbidden,
-            404 => HttpStatus::NotFound,
-            405 => HttpStatus::MethodNotAllowed,
-            413 => HttpStatus::PayloadTooLarge,
-            500 => HttpStatus::InternalServerError,
-            501 => HttpStatus::NotImplemented,
-            _ => HttpStatus::InternalServerError,
-        };
+        let status = HttpStatus::from_code(code).unwrap_or(HttpStatus::InternalServerError);
 
         // Try custom error page
         if let Some(page_path) = self.error_pages.get(&code) {
@@ -507,6 +504,302 @@ fn set_nonblocking_cgi(fd: i32) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
+
+    use crate::config::HttpMethod as M;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Dossier temporaire propre à chaque test (les tests tournent en parallèle).
+    struct Bac(PathBuf);
+    impl Bac {
+        fn new() -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let p = std::env::temp_dir().join(format!("lh-router-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+            std::fs::create_dir_all(p.join("www/docs")).unwrap();
+            std::fs::write(p.join("www/index.html"), "<h1>accueil</h1>").unwrap();
+            std::fs::write(p.join("www/style.css"), "body{}").unwrap();
+            std::fs::write(p.join("www/docs/b.txt"), "bbb").unwrap();
+            std::fs::write(p.join("www/docs/A.txt"), "aa").unwrap();
+            std::fs::create_dir_all(p.join("www/docs/sous-dossier")).unwrap();
+            std::fs::write(p.join("secret.txt"), "SECRET").unwrap();
+            Bac(p)
+        }
+        fn www(&self) -> String { self.0.join("www").to_string_lossy().into_owned() }
+        fn route(&self, path: &str) -> RouteConfig {
+            RouteConfig { path: path.into(), root_directory: Some(self.www()), index_file: Some("index.html".into()), ..Default::default() }
+        }
+    }
+    impl Drop for Bac {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn routeur(routes: Vec<RouteConfig>) -> Router {
+        Router::new(&ServerConfig { routes, ..Default::default() })
+    }
+
+    fn requete(method: &str, path: &str) -> HttpRequest {
+        HttpRequest::parse(format!("{} {} HTTP/1.1\r\nHost: t\r\n\r\n", method, path).as_bytes()).unwrap()
+    }
+
+    fn ok(r: Result<HttpResponse, CgiInfo>) -> HttpResponse {
+        match r { Ok(res) => res, Err(_) => panic!("CGI inattendu") }
+    }
+
+    fn statut(router: &Router, method: &str, path: &str) -> u16 {
+        ok(router.handle_request(&requete(method, path))).status as u16
+    }
+
+    #[test]
+    fn sert_le_fichier_index_d_un_dossier() {
+        let bac = Bac::new();
+        let res = ok(routeur(vec![bac.route("/")]).handle_request(&requete("GET", "/")));
+        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.body, b"<h1>accueil</h1>");
+        assert_eq!(res.headers.get("Content-Type").map(String::as_str), Some("text/html; charset=utf-8"));
+    }
+
+    #[test]
+    fn sert_un_fichier_statique_avec_son_type_mime() {
+        let bac = Bac::new();
+        let res = ok(routeur(vec![bac.route("/")]).handle_request(&requete("GET", "/style.css")));
+        assert_eq!(res.body, b"body{}");
+        assert_eq!(res.headers.get("Content-Type").map(String::as_str), Some("text/css"));
+        assert_eq!(res.headers.get("Content-Length").map(String::as_str), Some("6"));
+    }
+
+    #[test]
+    fn fichier_absent_404() {
+        let bac = Bac::new();
+        assert_eq!(statut(&routeur(vec![bac.route("/")]), "GET", "/absent.html"), 404);
+    }
+
+    #[test]
+    fn aucune_route_correspondante_404() {
+        let bac = Bac::new();
+        assert_eq!(statut(&routeur(vec![bac.route("/app")]), "GET", "/autre"), 404);
+        assert_eq!(statut(&routeur(vec![]), "GET", "/"), 404);
+    }
+
+    #[test]
+    fn la_route_la_plus_longue_l_emporte() {
+        let bac = Bac::new();
+        let mut docs = bac.route("/docs");
+        docs.root_directory = Some(bac.0.join("www/docs").to_string_lossy().into_owned());
+        let racine = RouteConfig { accepted_methods: vec![], ..bac.route("/") };
+        let router = routeur(vec![racine, docs]);
+        let res = ok(router.handle_request(&requete("GET", "/docs/b.txt")));
+        assert_eq!(res.body, b"bbb");
+        // « / » n'autorise aucune méthode : prouve que c'est bien « /docs » qui a répondu.
+        assert_eq!(statut(&router, "GET", "/style.css"), 405);
+    }
+
+    #[test]
+    fn methode_non_autorisee_405() {
+        let bac = Bac::new();
+        let route = RouteConfig { accepted_methods: vec![M::Get], ..bac.route("/") };
+        let router = routeur(vec![route]);
+        assert_eq!(statut(&router, "POST", "/"), 405);
+        assert_eq!(statut(&router, "DELETE", "/style.css"), 405);
+        assert_eq!(statut(&router, "GET", "/"), 200);
+    }
+
+    #[test]
+    fn methode_inconnue_501_avant_tout_routage() {
+        assert_eq!(statut(&routeur(vec![]), "PUT", "/"), 501);
+        assert_eq!(statut(&routeur(vec![]), "PATCH", "/inexistant"), 501);
+    }
+
+    #[test]
+    fn corps_trop_gros_413() {
+        let bac = Bac::new();
+        let router = Router::new(&ServerConfig { routes: vec![bac.route("/")], client_max_body_size: Some(4), ..Default::default() });
+        let req = HttpRequest::parse(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n12345").unwrap();
+        assert_eq!(ok(router.handle_request(&req)).status, HttpStatus::PayloadTooLarge);
+        let req = HttpRequest::parse(b"GET / HTTP/1.1\r\nContent-Length: 4\r\n\r\n1234").unwrap();
+        assert_eq!(ok(router.handle_request(&req)).status, HttpStatus::Ok);
+    }
+
+    #[test]
+    fn redirection_301_avec_location() {
+        let route = RouteConfig { path: "/ancien".into(), redirection: Some("/nouveau".into()), ..Default::default() };
+        let res = ok(routeur(vec![route]).handle_request(&requete("GET", "/ancien/page")));
+        assert_eq!(res.status, HttpStatus::MovedPermanently);
+        assert_eq!(res.headers.get("Location").map(String::as_str), Some("/nouveau"));
+        assert!(res.body.is_empty());
+    }
+
+    #[test]
+    fn route_sans_racine_500() {
+        let route = RouteConfig { path: "/".into(), ..Default::default() };
+        assert_eq!(statut(&routeur(vec![route]), "GET", "/"), 500);
+    }
+
+    #[test]
+    fn dossier_sans_index_ni_listing_403() {
+        let bac = Bac::new();
+        assert_eq!(statut(&routeur(vec![bac.route("/")]), "GET", "/docs"), 403);
+    }
+
+    #[test]
+    fn listing_de_dossier_trie_et_complet() {
+        let bac = Bac::new();
+        let route = RouteConfig { directory_listing: true, ..bac.route("/") };
+        let res = ok(routeur(vec![route]).handle_request(&requete("GET", "/docs/")));
+        let html = String::from_utf8(res.body).unwrap();
+        assert!(html.contains("Index de /docs/"));
+        assert!(html.contains("3 élément(s)"));
+        assert!(html.contains("href=\"../\""));
+        // Dossiers d'abord, puis fichiers par ordre alphabétique sans tenir compte de la casse.
+        let (d, a, b) = (html.find("sous-dossier/").unwrap(), html.find("A.txt").unwrap(), html.find("b.txt").unwrap());
+        assert!(d < a && a < b);
+        assert!(html.contains("<td>2 B</td>"));
+    }
+
+    #[test]
+    fn listing_echappe_les_noms_de_fichier() {
+        let bac = Bac::new();
+        std::fs::write(bac.0.join("www/docs/<script>.txt"), "x").unwrap();
+        let route = RouteConfig { directory_listing: true, ..bac.route("/") };
+        let html = String::from_utf8(ok(routeur(vec![route]).handle_request(&requete("GET", "/docs/"))).body).unwrap();
+        assert!(html.contains("&lt;script&gt;.txt"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn refuse_la_remontee_de_dossier() {
+        let bac = Bac::new();
+        let router = routeur(vec![bac.route("/")]);
+        assert_eq!(statut(&router, "GET", "/../secret.txt"), 400);
+        assert_eq!(statut(&router, "GET", "/docs/../../secret.txt"), 400);
+        assert_eq!(statut(&router, "GET", "/./style.css"), 200);
+    }
+
+    #[test]
+    fn delete_ne_peut_pas_sortir_de_la_racine() {
+        let bac = Bac::new();
+        assert_eq!(statut(&routeur(vec![bac.route("/")]), "DELETE", "/../secret.txt"), 400);
+        assert!(bac.0.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn delete_supprime_le_fichier_204() {
+        let bac = Bac::new();
+        let router = routeur(vec![bac.route("/")]);
+        assert_eq!(statut(&router, "DELETE", "/docs/b.txt"), 204);
+        assert!(!bac.0.join("www/docs/b.txt").exists());
+        assert_eq!(statut(&router, "DELETE", "/docs/b.txt"), 404);
+    }
+
+    #[test]
+    fn page_d_erreur_personnalisee() {
+        let bac = Bac::new();
+        let page = bac.0.join("404.html");
+        std::fs::write(&page, "<p>perdu ?</p>").unwrap();
+        let mut errors = std::collections::HashMap::new();
+        errors.insert(404, page.to_string_lossy().into_owned());
+        let router = Router::new(&ServerConfig { routes: vec![bac.route("/")], error_pages: errors, ..Default::default() });
+        let res = ok(router.handle_request(&requete("GET", "/absent")));
+        assert_eq!(res.status, HttpStatus::NotFound);
+        assert_eq!(res.body, b"<p>perdu ?</p>");
+    }
+
+    #[test]
+    fn page_d_erreur_integree_si_fichier_introuvable() {
+        let mut errors = std::collections::HashMap::new();
+        errors.insert(404, "/nulle/part/404.html".to_string());
+        let router = Router::new(&ServerConfig { error_pages: errors, ..Default::default() });
+        let res = ok(router.handle_request(&requete("GET", "/x")));
+        let html = String::from_utf8(res.body).unwrap();
+        assert!(html.contains("<h1>404</h1>") && html.contains("Not Found"));
+    }
+
+    #[test]
+    fn upload_brut_sans_multipart() {
+        let bac = Bac::new();
+        let store = bac.0.join("depot");
+        let route = RouteConfig { upload_store: Some(store.to_string_lossy().into_owned()), ..bac.route("/up") };
+        let req = HttpRequest::parse(b"POST /up HTTP/1.1\r\nContent-Length: 5\r\n\r\nbrut!").unwrap();
+        let res = ok(routeur(vec![route]).handle_request(&req));
+        assert_eq!(res.status, HttpStatus::Created);
+        let fichiers: Vec<_> = std::fs::read_dir(&store).unwrap().flatten().collect();
+        assert_eq!(fichiers.len(), 1);
+        assert_eq!(std::fs::read(fichiers[0].path()).unwrap(), b"brut!");
+    }
+
+    #[test]
+    fn upload_multipart_plusieurs_fichiers() {
+        let bac = Bac::new();
+        let store = bac.0.join("depot");
+        let body = "--B\r\nContent-Disposition: form-data; name=\"a\"; filename=\"un.txt\"\r\n\r\n111\r\n\
+                    --B\r\nContent-Disposition: form-data; name=\"b\"; filename=\"deux.txt\"\r\n\r\n22\r\n--B--\r\n";
+        let mut req = requete("POST", "/up");
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=\"B\"".into());
+        req.body = body.as_bytes().to_vec();
+        let res = Router::new(&ServerConfig::default()).handle_upload(&req, &store.to_string_lossy());
+        assert_eq!(res.status, HttpStatus::Created);
+        assert_eq!(res.body, b"{\"saved\":2}");
+        assert_eq!(std::fs::read(store.join("un.txt")).unwrap(), b"111");
+        assert_eq!(std::fs::read(store.join("deux.txt")).unwrap(), b"22");
+    }
+
+    #[test]
+    fn upload_multipart_sans_boundary_400() {
+        let bac = Bac::new();
+        let mut req = requete("POST", "/up");
+        req.headers.insert("content-type".into(), "multipart/form-data".into());
+        req.body = b"peu importe".to_vec();
+        let res = Router::new(&ServerConfig::default()).handle_upload(&req, &bac.0.join("d").to_string_lossy());
+        assert_eq!(res.status, HttpStatus::BadRequest);
+    }
+
+    #[test]
+    fn upload_multipart_sans_partie_valide_400() {
+        let bac = Bac::new();
+        let mut req = requete("POST", "/up");
+        req.headers.insert("content-type".into(), "multipart/form-data; boundary=B".into());
+        req.body = b"aucun delimiteur ici".to_vec();
+        let res = Router::new(&ServerConfig::default()).handle_upload(&req, &bac.0.join("d").to_string_lossy());
+        assert_eq!(res.status, HttpStatus::BadRequest);
+    }
+
+    #[test]
+    fn cgi_lance_le_script_et_rend_la_main() {
+        let bac = Bac::new();
+        let script = bac.0.join("www/hello.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n%s' \"$QUERY_STRING\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let route = RouteConfig { cgi_extension: Some(".sh".into()), ..bac.route("/") };
+        let info = match routeur(vec![route]).handle_request(&requete("GET", "/hello.sh?nom=test")) {
+            Err(info) => info,
+            Ok(res) => panic!("CGI attendu, reçu {}", res.status as u16),
+        };
+        // Lecture de la sortie du script jusqu'à EOF (le descripteur est non bloquant).
+        let mut sortie = Vec::new();
+        let mut buf = [0u8; 256];
+        let debut = std::time::Instant::now();
+        loop {
+            let n = unsafe { libc::read(info.stdout_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 { sortie.extend_from_slice(&buf[..n as usize]); continue; }
+            if n == 0 || debut.elapsed().as_secs() > 5 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut st = 0;
+        unsafe {
+            libc::waitpid(info.pid, &mut st, 0);
+            libc::close(info.stdin_fd);
+            libc::close(info.stdout_fd);
+        }
+        assert_eq!(String::from_utf8_lossy(&sortie), "Content-Type: text/plain\r\n\r\nnom=test");
+        assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
+    }
+
+    #[test]
+    fn extension_cgi_differente_servie_comme_fichier() {
+        let bac = Bac::new();
+        let route = RouteConfig { cgi_extension: Some(".py".into()), ..bac.route("/") };
+        let res = ok(routeur(vec![route]).handle_request(&requete("GET", "/style.css")));
+        assert_eq!(res.body, b"body{}");
+    }
 
     #[test]
     fn upload_multipart_preserve_les_octets() {

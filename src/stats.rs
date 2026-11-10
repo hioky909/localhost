@@ -166,4 +166,121 @@ mod tests {
         assert!((s.success_rate() - 95.0 * 100.0 / 101.0 - 100.0 / 101.0).abs() < 1e-9);
         assert!(s.to_json("1.0.0", 1, &["127.0.0.1:8080".into()]).contains("\"s5xx\":5"));
     }
+
+    #[test]
+    fn etat_initial() {
+        let s = Stats::new();
+        assert_eq!(s.requests, 0);
+        assert_eq!(s.percentile(50.0), 0);
+        assert_eq!(s.success_rate(), 100.0);
+        assert_eq!(s.uptime_secs(), 0);
+    }
+
+    #[test]
+    fn connexions_actives_et_pic() {
+        let mut s = Stats::new();
+        s.connection_opened();
+        s.connection_opened();
+        s.connection_opened();
+        s.connection_closed();
+        assert_eq!((s.accepted, s.active, s.peak), (3, 2, 3));
+        s.connection_closed();
+        s.connection_closed();
+        s.connection_closed(); // fermeture en trop : pas de dépassement négatif
+        assert_eq!((s.active, s.peak), (0, 3));
+    }
+
+    #[test]
+    fn repartition_par_methode_et_par_classe() {
+        let mut s = Stats::new();
+        for (m, code) in [("GET", 200), ("GET", 304), ("POST", 201), ("DELETE", 204), ("PUT", 501), ("GET", 404), ("GET", 101)] {
+            s.record(m, code, 1, 0, 0);
+        }
+        assert_eq!(s.by_method, [4, 1, 1, 1]);
+        assert_eq!(s.by_class, [0, 1, 3, 1, 1, 1]);
+    }
+
+    #[test]
+    fn statut_hors_norme_classe_comme_erreur_serveur() {
+        let mut s = Stats::new();
+        s.record("GET", 999, 1, 0, 0);
+        assert_eq!(s.by_class[5], 1);
+    }
+
+    #[test]
+    fn cumule_les_octets() {
+        let mut s = Stats::new();
+        s.record("POST", 201, 1, 1000, 50);
+        s.record("GET", 200, 1, 80, 4096);
+        assert_eq!((s.bytes_in, s.bytes_out), (1080, 4146));
+    }
+
+    #[test]
+    fn percentiles_extremes() {
+        let mut s = Stats::new();
+        for v in [30, 10, 20] {
+            s.record("GET", 200, v, 0, 0);
+        }
+        assert_eq!(s.percentile(0.0), 10);
+        assert_eq!(s.percentile(50.0), 20);
+        assert_eq!(s.percentile(100.0), 30);
+        assert_eq!(s.percentile(250.0), 30);
+    }
+
+    #[test]
+    fn fenetre_glissante_de_4096_mesures() {
+        let mut s = Stats::new();
+        for _ in 0..WINDOW {
+            s.record("GET", 200, 1_000_000, 0, 0);
+        }
+        for _ in 0..WINDOW {
+            s.record("GET", 200, 5, 0, 0);
+        }
+        // Les anciennes mesures (lentes) sont sorties de la fenêtre.
+        assert_eq!(s.percentile(100.0), 5);
+        assert_eq!(s.requests, 2 * WINDOW as u64);
+    }
+
+    #[test]
+    fn tick_compte_les_requetes_depuis_le_precedent() {
+        let mut s = Stats::new();
+        for _ in 0..7 {
+            s.record("GET", 200, 1, 0, 0);
+        }
+        let (n, debit) = s.tick();
+        assert_eq!(n, 7);
+        assert!(debit > 0.0);
+        assert_eq!(s.tick().0, 0);
+        s.record("GET", 200, 1, 0, 0);
+        assert_eq!(s.tick().0, 1);
+    }
+
+    #[test]
+    fn taux_de_succes_ignore_les_erreurs_client() {
+        let mut s = Stats::new();
+        s.record("GET", 404, 1, 0, 0);
+        s.record("GET", 403, 1, 0, 0);
+        assert_eq!(s.success_rate(), 100.0);
+        s.record("GET", 502, 1, 0, 0);
+        assert!((s.success_rate() - 200.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn json_complet_et_bien_forme() {
+        let mut s = Stats::new();
+        s.connection_opened();
+        s.record("POST", 201, 42, 10, 20);
+        s.cgi_runs = 3;
+        s.uploads = 2;
+        let j = s.to_json("9.9.9", 1234, &["127.0.0.1:8080".into(), "127.0.0.1:8081".into()]);
+        assert!(j.starts_with('{') && j.ends_with('}'));
+        for attendu in [
+            "\"version\":\"9.9.9\"", "\"pid\":1234", "\"listeners\":\"127.0.0.1:8080,127.0.0.1:8081\"",
+            "\"requests\":1", "\"active\":1", "\"s2xx\":1", "\"post\":1", "\"bytes_in\":10",
+            "\"bytes_out\":20", "\"p50_us\":42", "\"cgi_runs\":3", "\"uploads\":2",
+        ] {
+            assert!(j.contains(attendu), "{} absent de {}", attendu, j);
+        }
+        assert_eq!(j.matches(':').count(), 27 + 2); // 27 clés + les « : » des adresses d'écoute
+    }
 }

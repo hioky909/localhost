@@ -152,3 +152,113 @@ pub fn clock() -> String {
     unsafe { libc::localtime_r(&t, &mut tm) };
     format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec / 1000)
 }
+
+#[cfg(test)]
+mod tests {
+    // Les couleurs restent désactivées pendant les tests (init() n'est jamais appelé) :
+    // on vérifie le rendu texte, et le calcul de largeur sur des séquences ANSI écrites à la main.
+    use super::*;
+
+    #[test]
+    fn sans_couleur_le_texte_est_inchange() {
+        assert!(!enabled());
+        assert_eq!(paint("1;32", "ok"), "ok");
+        assert_eq!(status(404), "404");
+        assert_eq!(method_word("GET"), "GET");
+    }
+
+    #[test]
+    fn tailles_lisibles() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(1023), "1023 B");
+        assert_eq!(bytes(1024), "1.0 KB");
+        assert_eq!(bytes(1536), "1.5 KB");
+        assert_eq!(bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn tailles_plafonnees_au_giga() {
+        assert_eq!(bytes(2048 * 1024 * 1024 * 1024), "2048.0 GB");
+    }
+
+    #[test]
+    fn durees_en_micro_milli_et_secondes() {
+        assert_eq!(micros(0), "0 µs");
+        assert_eq!(micros(999), "999 µs");
+        assert_eq!(micros(1_000), "1.00 ms");
+        assert_eq!(micros(12_345), "12.35 ms");
+        assert_eq!(micros(1_000_000), "1.00 s");
+        assert_eq!(micros(2_500_000), "2.50 s");
+    }
+
+    #[test]
+    fn temps_de_fonctionnement() {
+        assert_eq!(uptime(0), "0s");
+        assert_eq!(uptime(59), "59s");
+        assert_eq!(uptime(60), "1m 00s");
+        assert_eq!(uptime(3599), "59m 59s");
+        assert_eq!(uptime(3600), "1h 00m 00s");
+        assert_eq!(uptime(90061), "25h 01m 01s");
+    }
+
+    #[test]
+    fn largeur_visible_ignore_les_sequences_ansi() {
+        assert_eq!(visible_len("abc"), 3);
+        assert_eq!(visible_len("\x1b[1;32mabc\x1b[0m"), 3);
+        assert_eq!(visible_len("\x1b[38;5;208m◆\x1b[0m x"), 3);
+        assert_eq!(visible_len(""), 0);
+    }
+
+    #[test]
+    fn largeur_visible_compte_les_caracteres_unicode() {
+        assert_eq!(visible_len("µs"), 2);
+        assert_eq!(visible_len("é→█"), 3);
+    }
+
+    #[test]
+    fn remplissage_a_droite_et_a_gauche() {
+        assert_eq!(pad("ab", 5), "ab   ");
+        assert_eq!(pad_left("ab", 5), "   ab");
+        assert_eq!(pad("abcdef", 3), "abcdef");
+        assert_eq!(pad_left("abcdef", 3), "abcdef");
+    }
+
+    #[test]
+    fn remplissage_tient_compte_des_couleurs() {
+        let colore = "\x1b[32mok\x1b[0m";
+        assert_eq!(visible_len(&pad(colore, 6)), 6);
+        assert!(pad(colore, 6).starts_with(colore));
+        assert_eq!(visible_len(&pad_left(colore, 6)), 6);
+    }
+
+    #[test]
+    fn methode_alignee_sur_six_colonnes() {
+        assert_eq!(method("GET"), "GET   ");
+        assert_eq!(method("DELETE"), "DELETE");
+        assert_eq!(method("OPTIONS"), "OPTIONS");
+    }
+
+    #[test]
+    fn barre_proportionnelle() {
+        assert_eq!(bar(5, 10, 10), format!("{}{}", "█".repeat(5), "░".repeat(5)));
+        assert_eq!(bar(10, 10, 4), "████");
+        assert_eq!(bar(0, 10, 4), "░░░░");
+    }
+
+    #[test]
+    fn barre_bornee_et_maximum_nul() {
+        assert_eq!(bar(50, 10, 4), "████");
+        assert_eq!(bar(3, 0, 4), "    ");
+        assert_eq!(visible_len(&bar(1, 3, 7)), 7);
+    }
+
+    #[test]
+    fn horloge_au_format_hh_mm_ss_mmm() {
+        let c = clock();
+        let b = c.as_bytes();
+        assert_eq!(c.len(), 12, "{}", c);
+        assert!(b[2] == b':' && b[5] == b':' && b[8] == b'.');
+        assert!(c.chars().filter(|ch| ch.is_ascii_digit()).count() == 9);
+    }
+}

@@ -136,6 +136,15 @@ impl Client {
                     std::mem::forget(file);
                     return Ok(true);
                 }
+                if HttpRequest::is_malformed(&self.read_buffer) {
+                    let mut res = HttpResponse::new(HttpStatus::BadRequest);
+                    res.set_header("Content-Type", "text/plain; charset=utf-8");
+                    res.set_body(b"Bad Request".to_vec());
+                    self.write_buffer = res.to_bytes();
+                    self.state = ClientState::WritingResponse;
+                    std::mem::forget(file);
+                    return Ok(true);
+                }
                 if !self.sent_continue && HttpRequest::expects_continue(&self.read_buffer) {
                     // curl & co. attendent ce feu vert avant d'envoyer un corps volumineux.
                     let _ = file.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -258,15 +267,8 @@ impl Client {
                     let value = line[colon_idx + 1..].trim();
                     if key.to_lowercase() == "status" {
                         if let Some(code) = value.split_whitespace().next().and_then(|s| s.parse::<u16>().ok()) {
-                            res.status = match code {
-                                200 => HttpStatus::Ok,
-                                201 => HttpStatus::Created,
-                                400 => HttpStatus::BadRequest,
-                                403 => HttpStatus::Forbidden,
-                                404 => HttpStatus::NotFound,
-                                500 => HttpStatus::InternalServerError,
-                                _ => HttpStatus::Ok,
-                            };
+                            // Code non géré : on garde 200 plutôt que d'envoyer un statut inventé.
+                            res.status = HttpStatus::from_code(code).unwrap_or(HttpStatus::Ok);
                         }
                     } else {
                         res.set_header(key, value);
@@ -310,5 +312,274 @@ impl Client {
 
         std::mem::forget(file);
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Paire de sockets connectées : `ours` joue le client distant, `fd` est donné au serveur.
+    struct Paire {
+        fd: RawFd,
+        ours: RawFd,
+    }
+    impl Paire {
+        fn new() -> Self {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0, fds.as_mut_ptr()) }, 0);
+            Paire { fd: fds[0], ours: fds[1] }
+        }
+        fn envoyer(&self, data: &[u8]) {
+            assert_eq!(unsafe { libc::write(self.ours, data.as_ptr() as *const _, data.len()) }, data.len() as isize);
+        }
+        fn recevoir(&self) -> Vec<u8> {
+            let mut buf = vec![0u8; 65536];
+            let n = unsafe { libc::read(self.ours, buf.as_mut_ptr() as *mut _, buf.len()) };
+            buf.truncate(n.max(0) as usize);
+            buf
+        }
+        fn fermer_distant(&mut self) {
+            unsafe { libc::close(self.ours) };
+            self.ours = -1;
+        }
+    }
+    impl Drop for Paire {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+                if self.ours >= 0 {
+                    libc::close(self.ours);
+                }
+            }
+        }
+    }
+
+    fn client(cfg: ServerConfig) -> Client {
+        Client::new(-1, cfg, "127.0.0.1:50000".into())
+    }
+
+    fn avec_sortie_cgi(sortie: &[u8]) -> Client {
+        let mut c = client(ServerConfig::default());
+        c.write_buffer = sortie.to_vec();
+        c.parse_cgi_response();
+        c
+    }
+
+    #[test]
+    fn etat_initial() {
+        let c = client(ServerConfig::default());
+        assert_eq!(c.state, ClientState::ReadingRequest);
+        assert_eq!(c.peer, "127.0.0.1:50000");
+        assert!(c.started_at.is_none() && !c.internal && !c.sent_continue);
+    }
+
+    #[test]
+    fn statut_lu_sur_la_ligne_d_etat() {
+        let mut c = client(ServerConfig::default());
+        assert_eq!(c.status_code(), 0);
+        c.write_buffer = b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec();
+        assert_eq!(c.status_code(), 404);
+        c.write_buffer = b"n'importe quoi".to_vec();
+        assert_eq!(c.status_code(), 0);
+    }
+
+    #[test]
+    fn methode_et_chemin_depuis_la_requete_analysee() {
+        let mut c = client(ServerConfig::default());
+        c.request = HttpRequest::parse(b"DELETE /f.txt?force=1 HTTP/1.1\r\n\r\n");
+        assert_eq!(c.method_and_path(), ("DELETE".into(), "/f.txt?force=1".into()));
+        c.request = HttpRequest::parse(b"PUT /x HTTP/1.1\r\n\r\n");
+        assert_eq!(c.method_and_path(), ("PUT".into(), "/x".into()));
+    }
+
+    #[test]
+    fn methode_et_chemin_depuis_les_octets_bruts() {
+        let mut c = client(ServerConfig::default());
+        assert_eq!(c.method_and_path(), ("-".into(), "-".into()));
+        c.read_buffer = b"POST /upload HTTP/1.1\r\nContent-Length: 999999".to_vec();
+        assert_eq!(c.method_and_path(), ("POST".into(), "/upload".into()));
+    }
+
+    #[test]
+    fn hote_depuis_l_en_tete_ou_le_server_name() {
+        let cfg = ServerConfig { server_names: vec!["defaut.local".into()], ..Default::default() };
+        let mut c = client(cfg);
+        assert_eq!(c.host(), "defaut.local");
+        c.request = HttpRequest::parse(b"GET / HTTP/1.1\r\nHost: b.local:8080\r\n\r\n");
+        assert_eq!(c.host(), "b.local:8080");
+        assert_eq!(client(ServerConfig::default()).host(), "");
+    }
+
+    #[test]
+    fn sortie_cgi_avec_en_tetes_crlf() {
+        let c = avec_sortie_cgi(b"Content-Type: text/plain\r\nX-Script: oui\r\n\r\nbonjour");
+        let res = c.response.unwrap();
+        assert_eq!(res.status, HttpStatus::Ok);
+        assert_eq!(res.headers.get("Content-Type").map(String::as_str), Some("text/plain"));
+        assert_eq!(res.headers.get("X-Script").map(String::as_str), Some("oui"));
+        assert_eq!(res.body, b"bonjour");
+        assert!(c.write_buffer.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn sortie_cgi_avec_simples_sauts_de_ligne() {
+        let res = avec_sortie_cgi(b"Content-Type: text/html\n\n<p>ok</p>").response.unwrap();
+        assert_eq!(res.headers.get("Content-Type").map(String::as_str), Some("text/html"));
+        assert_eq!(res.body, b"<p>ok</p>");
+    }
+
+    #[test]
+    fn sortie_cgi_avec_en_tete_status() {
+        let res = avec_sortie_cgi(b"Status: 404 Not Found\r\n\r\nintrouvable").response.unwrap();
+        assert_eq!(res.status, HttpStatus::NotFound);
+        assert!(!res.headers.contains_key("Status"));
+        let res = avec_sortie_cgi(b"Status: 302\r\nLocation: /ailleurs\r\n\r\n").response.unwrap();
+        assert_eq!(res.status, HttpStatus::Found);
+        assert_eq!(res.headers.get("Location").map(String::as_str), Some("/ailleurs"));
+    }
+
+    #[test]
+    fn sortie_cgi_status_non_gere_reste_a_200() {
+        let res = avec_sortie_cgi(b"Status: 418 I'm a teapot\r\n\r\n").response.unwrap();
+        assert_eq!(res.status, HttpStatus::Ok);
+    }
+
+    #[test]
+    fn sortie_cgi_sans_en_tetes_devient_le_corps() {
+        let res = avec_sortie_cgi(b"juste du texte").response.unwrap();
+        assert_eq!(res.body, b"juste du texte");
+        assert_eq!(res.headers.get("Content-Length").map(String::as_str), Some("14"));
+    }
+
+    #[test]
+    fn sortie_cgi_corps_binaire_preserve() {
+        let mut sortie = b"Content-Type: application/octet-stream\r\n\r\n".to_vec();
+        sortie.extend_from_slice(&[0, 159, 255, 13, 10]);
+        assert_eq!(avec_sortie_cgi(&sortie).response.unwrap().body, vec![0, 159, 255, 13, 10]);
+    }
+
+    #[test]
+    fn lit_une_requete_complete() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        p.envoyer(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.state, ClientState::Processing);
+        assert_eq!(c.request.as_ref().unwrap().path, "/a");
+        assert!(c.started_at.is_some());
+    }
+
+    #[test]
+    fn requete_en_plusieurs_morceaux() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        p.envoyer(b"POST /f HTTP/1.1\r\nContent-Length: 6\r\n\r\nabc");
+        assert!(!c.read_data().unwrap());
+        assert_eq!(c.state, ClientState::ReadingRequest);
+        assert!(!c.read_data().unwrap()); // rien de nouveau : WouldBlock sans erreur
+        p.envoyer(b"def");
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.request.as_ref().unwrap().body, b"abcdef");
+    }
+
+    #[test]
+    fn deconnexion_du_client() {
+        let mut p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        p.fermer_distant();
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.state, ClientState::Done);
+    }
+
+    #[test]
+    fn requete_trop_volumineuse_413_sans_attendre_la_fin() {
+        let p = Paire::new();
+        let cfg = ServerConfig { client_max_body_size: Some(64), ..Default::default() };
+        let mut c = Client::new(p.fd, cfg, "x".into());
+        let mut raw = b"POST / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat(b'a').take(100));
+        p.envoyer(&raw);
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.state, ClientState::WritingResponse);
+        assert_eq!(c.status_code(), 413);
+    }
+
+    #[test]
+    fn requete_malformee_400_immediat() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        p.envoyer(b"GET\r\n\r\n");
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.state, ClientState::WritingResponse);
+        assert_eq!(c.status_code(), 400);
+    }
+
+    #[test]
+    fn envoie_100_continue_une_seule_fois() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        p.envoyer(b"POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+        assert!(!c.read_data().unwrap());
+        assert_eq!(p.recevoir(), b"HTTP/1.1 100 Continue\r\n\r\n");
+        p.envoyer(b"ab");
+        assert!(!c.read_data().unwrap());
+        assert!(p.recevoir().is_empty());
+        p.envoyer(b"cd");
+        assert!(c.read_data().unwrap());
+        assert_eq!(c.request.as_ref().unwrap().body, b"abcd");
+    }
+
+    #[test]
+    fn traitement_sans_requete_400() {
+        let mut c = client(ServerConfig::default());
+        let res = c.process_request().ok().unwrap();
+        assert_eq!(res.status, HttpStatus::BadRequest);
+        assert_eq!(c.state, ClientState::WritingResponse);
+        assert_eq!(c.status_code(), 400);
+    }
+
+    #[test]
+    fn traitement_prepare_la_reponse() {
+        let mut c = client(ServerConfig::default());
+        c.request = HttpRequest::parse(b"GET /rien HTTP/1.1\r\n\r\n");
+        let res = c.process_request().ok().unwrap();
+        assert_eq!(res.status, HttpStatus::NotFound);
+        assert_eq!(c.state, ClientState::WritingResponse);
+        assert_eq!(c.status_code(), 404);
+        assert!(c.response.is_some());
+    }
+
+    #[test]
+    fn ecrit_toute_la_reponse_puis_termine() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        c.write_buffer = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        assert!(c.write_data().unwrap());
+        assert_eq!(c.state, ClientState::Done);
+        assert_eq!(c.written_bytes, c.write_buffer.len());
+        assert_eq!(p.recevoir(), b"HTTP/1.1 204 No Content\r\n\r\n");
+        assert!(c.write_data().unwrap()); // rien à écrire : reste terminé
+    }
+
+    #[test]
+    fn grosse_reponse_ecrite_en_plusieurs_fois() {
+        let p = Paire::new();
+        let mut c = Client::new(p.fd, ServerConfig::default(), "x".into());
+        c.write_buffer = vec![b'z'; 4 * 1024 * 1024];
+        let mut recu = 0;
+        let mut tours = 0;
+        while !c.write_data().unwrap() {
+            recu += p.recevoir().len();
+            tours += 1;
+            assert!(tours < 10_000);
+        }
+        loop {
+            let n = p.recevoir().len();
+            if n == 0 { break; }
+            recu += n;
+        }
+        assert!(tours > 0, "le tampon du socket aurait dû saturer");
+        assert_eq!(recu, 4 * 1024 * 1024);
     }
 }
